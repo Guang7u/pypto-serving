@@ -41,7 +41,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer, model_validator
+    from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -93,6 +93,20 @@ class ChatMessage(BaseModel):
     reasoning: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _normalize_text_parts(cls, value):
+        """Accept Chat text parts, including gateway-restored assistant history."""
+        if not isinstance(value, list):
+            return value
+        parts = []
+        for part in value:
+            if (not isinstance(part, dict) or part.get("type") != "text"
+                    or not isinstance(part.get("text"), str)):
+                raise ValueError("content parts must contain only text items with string text")
+            parts.append(part["text"])
+        return "".join(parts)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
