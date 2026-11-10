@@ -144,3 +144,18 @@ def test_mismatched_abort_cannot_release_a_retired_requests_native_object(rememb
     assert objects.status(receipt)["live"] is True
     asyncio.run(service.cancel_binding(original.binding))
     assert objects.status(receipt)["live"] is False
+
+
+def test_native_capabilities_require_the_internal_credential(monkeypatch):
+    monkeypatch.setenv("PYPTO_STATEFUL_INTERNAL_TOKEN", "native-capabilities-test-credential")
+
+    async def run():
+        router = ServingRouter(config(), client_factory=lambda _: httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(503)), timeout=1))
+        async with router.app.router.lifespan_context(router.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=router.app),
+                                         base_url="http://router") as client:
+                response = await client.post("/internal/stateful/v1/capabilities", json={"model": "model"})
+            assert response.status_code == 401
+
+    asyncio.run(run())

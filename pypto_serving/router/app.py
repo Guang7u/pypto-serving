@@ -153,7 +153,7 @@ class ServingRouter:
                 path, self._make_handler(path), methods=["POST"], response_model=None
             )
         if self.config.is_pd:
-            for suffix in ("tokenize", "generate", "objects/status", "objects/release"):
+            for suffix in ("capabilities", "tokenize", "generate", "objects/status", "objects/release", "objects/cancel"):
                 path = "/internal/stateful/v1/" + suffix
                 self.app.add_api_route(path, self._make_handler(path), methods=["POST"], response_model=None)
         # Admin surface. These start processes on other machines, so they are

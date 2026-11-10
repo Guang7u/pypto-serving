@@ -92,8 +92,10 @@ class Server(ServingServer):
         self.app.add_api_route("/internal/pd/descriptor", self.descriptor, methods=["GET"])
         self.app.add_api_route("/internal/pd/abort", self.abort, methods=["POST"])
         self.app.add_api_route("/internal/pd/requests/{request_id}", self.status, methods=["GET"])
-        for suffix, handler in (("tokenize", self.native_tokenize), ("generate", self.native_generate),
-                                ("objects/status", self.native_status), ("objects/release", self.native_release)):
+        for suffix, handler in (("capabilities", self.native_capabilities),
+                                ("tokenize", self.native_tokenize), ("generate", self.native_generate),
+                                ("objects/status", self.native_status), ("objects/release", self.native_release),
+                                ("objects/cancel", self.native_cancel)):
             self.app.add_api_route(INTERNAL_PREFIX + suffix, handler, methods=["POST"])
 
     def _native_objects(self):
@@ -102,6 +104,34 @@ class Server(ServingServer):
         if self.service.native_objects is None:
             self.service.native_objects = NativeObjects(self.service.cache, self.service.node, self.service.pins)
         return self.service.native_objects
+
+    async def native_capabilities(self, request: HTTPRequest):
+        authorize(request.headers)
+        if not self.service.is_ready():
+            raise NodeUnavailable("Native capabilities cannot be confirmed")
+        self._native_objects()
+        raw = await request.json()
+        node = self.service.node
+        if raw.get("model") != node.contract.model:
+            raise ValueError("model differs from the P owner")
+        return JSONResponse(dict(backend="pypto", model=node.contract.model, layout=node.contract.layout,
+            node_id=node.node_id, boot=node.boot, registry=node.registry, block_size=128, durability="volatile",
+            max_model_len=self.real_engine.config.resolve_runtime_config().max_seq_len,
+            raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
+            native_mount=False, streaming=False, tools=False, durable=False))
+
+    async def native_cancel(self, request: HTTPRequest):
+        authorize(request.headers)
+        raw = await request.json()
+        if raw.get("model") != self.service.node.contract.model:
+            raise ValueError("model differs from the P owner")
+        scope = owner(raw)
+        objects = self._native_objects()
+        for entry in tuple(self.service.requests.values()):
+            if entry.native_scope == scope:
+                await self.service.cancel_binding(entry.binding)
+        objects.discard_owner(scope)
+        return JSONResponse(dict(live=False, session_references=0))
 
     async def native_tokenize(self, request: HTTPRequest):
         authorize(request.headers)

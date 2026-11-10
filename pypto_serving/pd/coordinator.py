@@ -140,6 +140,7 @@ class PDCoordinator:
                     raise ValueError("Native requests currently require stream=false")
                 if path != INTERNAL_PREFIX + "generate":
                     return await self._native_owner_request(request, path, payload, session_id)
+                return await self._native_forward(request, path, owner, payload, session_id)
             return await self._forward(request, path, owner, payload, session_id)
         except (RouterError, ValueError, RuntimeError, asyncio.TimeoutError, OSError, httpx.HTTPError) as exc:
             error = failure(exc, timeout_code="pd_operation_timeout", protocol_code="pd_protocol_error")
@@ -154,6 +155,24 @@ class PDCoordinator:
             if self.active.get(owner) is None:
                 self.active.pop(owner, None)
 
+    async def _native_forward(self, request, path, owner, payload, session_id):
+        async def disconnected():
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        watch = asyncio.create_task(disconnected())
+        operation = asyncio.create_task(self._forward(request, path, owner, payload, session_id))
+        try:
+            done, _ = await asyncio.wait((watch, operation), return_when=asyncio.FIRST_COMPLETED)
+            if operation in done:
+                return operation.result()
+            raise RouterError(499, "native_client_disconnected", "Native client disconnected")
+        finally:
+            for task in (watch, operation):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(watch, operation, return_exceptions=True)
+
     async def abort(self, binding, endpoints):
         results = await asyncio.gather(*(self.client.post(e.base_url + "/internal/pd/abort",
             json=msgspec.to_builtins(binding), timeout=self._timeout(5, control=True))
@@ -163,7 +182,7 @@ class PDCoordinator:
                 logger.warning("HTTP abort not confirmed node=%s result=%s", endpoint.name, result)
 
     async def _native_owner_request(self, request, path, payload, session_id):
-        if path == INTERNAL_PREFIX + "tokenize":
+        if path in {INTERNAL_PREFIX + suffix for suffix in ("tokenize", "capabilities", "objects/cancel")}:
             candidates = [n for n in self.nodes.values() if n.role == "prefill"
                           and n.contract.model == payload.get("model")
                           and self.registry.state(n.node_id).routable]

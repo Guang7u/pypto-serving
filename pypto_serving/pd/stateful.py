@@ -150,6 +150,11 @@ class NativeObjects:
                 self.validate_binding(binding)
             self.release(record.receipt)
 
+    def discard_owner(self, scope):
+        for record in tuple(self.objects.values()):
+            if all(record.receipt.get(key) == value for key, value in scope.items()):
+                self.release(record.receipt)
+
     def close(self):
         for record in list(self.objects.values()):
             self.release(record.receipt)
