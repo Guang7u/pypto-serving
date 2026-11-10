@@ -1,12 +1,11 @@
 # Copyright (c) PyPTO Contributors.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to the License for details. You should not use this file except in compliance with the License.
+# Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
-# See LICENSE in the root directory of the online documentation for details.
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-
 """Host-staged local KV transfer framing checks (no device required)."""
 
 import threading
@@ -16,6 +15,7 @@ import pytest
 
 from pypto_serving.model.common.runner.l3_dispatch import PendingL3Dispatch, device_gate
 from pypto_serving.pd.local_transfer import HostTransfer
+from pypto_serving.pd import local_transfer
 from pypto_serving.pd.protocol import Copy
 from pypto_serving.pd.transfer import Region, TransferError
 
@@ -94,6 +94,18 @@ def test_out_of_range_copy_is_rejected_without_poisoning(pair):
     copy = Copy("kv", 0, 0, 0, 4096, 4096)
     sender.write("boot-d", [copy])
     assert bytes(destination.device[:4096]) == bytes(source.device[:4096])
+
+
+def test_transfer_after_an_idle_interval_preserves_the_registered_connection(monkeypatch, request):
+    # Shorten only the I/O clock; exercise the existing real loopback transfer.
+    monkeypatch.setattr(local_transfer, "_RECV_TIMEOUT", 0.1)
+    sender, _, source, destination = request.getfixturevalue("pair")
+    source.device[:64] = b"\x19" * 64
+    sender.write("boot-d", [Copy("kv", 0, 0, 0, 0, 64)])
+    time.sleep(0.3)
+    source.device[64:128] = b"\xa5" * 64
+    sender.write("boot-d", [Copy("kv", 0, 0, 64, 64, 64)])
+    assert bytes(destination.device[64:128]) == b"\xa5" * 64
 
 
 def test_receiver_rejects_unregistered_address(pair):

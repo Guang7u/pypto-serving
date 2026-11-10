@@ -9,13 +9,14 @@
 """Optional composition; Serving exposes capabilities, not PD business logic."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 import json
 import logging
 import multiprocessing
 import os
+from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
@@ -24,6 +25,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import msgspec
 
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, ReplicaEngineCore
+from pypto_serving.config.types import GenerateConfig
+from pypto_serving.router.http import RouterError
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.sched.scheduler import Scheduler
 from pypto_serving.serving.server.server import ChatCompletionRequest, CompletionRequest, ServingServer
@@ -32,6 +36,7 @@ from .adapter import select_adapter
 from .config import Config, log_context
 from .protocol import Binding, Continuation, Node, decode
 from .service import NodeUnavailable, Service
+from .stateful import INTERNAL_PREFIX, NativeObjects, authorize, owner
 from .worker import Progress, Services, WorkerSettings
 
 
@@ -72,6 +77,11 @@ class Server(ServingServer):
     def _register_exception_handlers(self):
         super()._register_exception_handlers()
         self.app.add_exception_handler(NodeUnavailable, self.unavailable)
+        self.app.add_exception_handler(RouterError, self.native_error)
+
+    @staticmethod
+    async def native_error(request, exc):
+        return JSONResponse(dict(object="error", code=exc.code, message=str(exc)), status_code=exc.status)
 
     @staticmethod
     async def unavailable(request, exc):
@@ -82,6 +92,79 @@ class Server(ServingServer):
         self.app.add_api_route("/internal/pd/descriptor", self.descriptor, methods=["GET"])
         self.app.add_api_route("/internal/pd/abort", self.abort, methods=["POST"])
         self.app.add_api_route("/internal/pd/requests/{request_id}", self.status, methods=["GET"])
+        for suffix, handler in (("tokenize", self.native_tokenize), ("generate", self.native_generate),
+                                ("objects/status", self.native_status), ("objects/release", self.native_release)):
+            self.app.add_api_route(INTERNAL_PREFIX + suffix, handler, methods=["POST"])
+
+    def _native_objects(self):
+        if self.service.role != "prefill":
+            raise ValueError("Native objects belong to the P owner")
+        if self.service.native_objects is None:
+            self.service.native_objects = NativeObjects(self.service.cache, self.service.node, self.service.pins)
+        return self.service.native_objects
+
+    async def native_tokenize(self, request: HTTPRequest):
+        authorize(request.headers)
+        if not self.service.is_ready():
+            raise NodeUnavailable("P tokenizer is unavailable")
+        self._native_objects()
+        public = ChatCompletionRequest.model_validate(await request.json())
+        if public.model != self.service.node.contract.model:
+            raise ValueError("model differs from the P owner")
+        prompt, config, parser, constraint = await self.prepare_chat(public)
+        self.service.adapter.validate(config)
+        if config.stream:
+            raise ValueError("Native generation currently requires stream=false")
+        return JSONResponse(dict(model=self.service.node.contract.model, layout=self.service.node.contract.layout,
+            prompt_token_ids=list(self.real_engine._tokenize_prompt(prompt)), generation=asdict(config),
+            parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None))
+
+    async def native_generate(self, request: HTTPRequest):
+        authorize(request.headers)
+        return await self.handle(request, "native")
+
+    async def native_status(self, request: HTTPRequest):
+        authorize(request.headers)
+        if not self.service.core.is_ready():
+            raise NodeUnavailable("Native object liveness cannot be confirmed")
+        raw = await request.json()
+        return JSONResponse(self._native_objects().status(raw.get("native")))
+
+    async def native_release(self, request: HTTPRequest):
+        authorize(request.headers)
+        raw = await request.json()
+        return JSONResponse(self._native_objects().release(raw.get("native")))
+
+    async def prepare_native(self, raw):
+        node = self.service.node
+        if raw.get("model") != node.contract.model or raw.get("layout") != node.contract.layout:
+            raise ValueError("Native generation model/layout mismatch")
+        if raw.get("parent") is not None:
+            raise ValueError("Native parent mounting is not implemented")
+        scope = owner(raw)
+        tokens = raw.get("prompt_token_ids")
+        if not isinstance(tokens, list) or not tokens or any(type(t) is not int or t < 0 for t in tokens):
+            raise ValueError("prompt_token_ids must be a non-empty list of non-negative integers")
+        vocab = json.loads((Path(self.real_engine.config.model_dir) / "config.json").read_text())["vocab_size"]
+        if any(t >= vocab for t in tokens):
+            raise ValueError("prompt_token_ids contains an out-of-vocabulary token")
+        if not isinstance(raw.get("generation"), dict):
+            raise ValueError("generation must be an object")
+        try:
+            config = GenerateConfig(**raw["generation"])
+            parser = OutputParserSpec(**raw["parser"]) if raw.get("parser") else None
+            constraint = ConstraintSpec.from_wire(raw["constraint"]) if raw.get("constraint") else None
+        except TypeError as exc:
+            raise ValueError("invalid native generation configuration") from exc
+        self.service.adapter.validate(config)
+        if config.stream or len(tokens) + config.max_new_tokens > self.real_engine.config.resolve_runtime_config().max_seq_len:
+            raise ValueError("Native generation requires stream=false and a bounded context/output budget")
+        if constraint is not None:
+            await self._preflight_constraint(constraint)
+        if self.service.role == "prefill":
+            self._native_objects()
+        return Continuation(tuple(tokens), asdict(config), asdict(parser) if parser else None,
+                            constraint.to_wire() if constraint else None), scope
 
     async def status(self, request_id: str):
         return JSONResponse(self.service.status(request_id))
@@ -118,19 +201,24 @@ class Server(ServingServer):
         binding, peer = decode(context["binding"], Binding), decode(context["peer"], Node)
         if not peer.compatible(self.service.node) or getattr(binding, peer.role) != peer.key:
             raise ValueError("HTTP peer differs from route binding")
-        public = (CompletionRequest if kind == "completion" else ChatCompletionRequest).model_validate(raw)
+        native = await self.prepare_native(raw) if kind == "native" else None
+        public = None if native is not None else (
+            CompletionRequest if kind == "completion" else ChatCompletionRequest).model_validate(raw)
         entry = self.service.register_http(binding, raw)
         if self.service.role == "prefill":
             try:
-                if kind == "chat":
-                    prompt, config, parser, constraint = await self.prepare_chat(public)
+                if native is not None:
+                    continuation, entry.native_scope = native
                 else:
-                    prompt, config = self.prepare_completion(public)
-                    parser = constraint = None
-                self.service.adapter.validate(config)
-                tokens = tuple(self.real_engine._tokenize_prompt(prompt))
-                continuation = Continuation(tokens, asdict(config), asdict(parser) if parser else None,
-                                            constraint.to_wire() if constraint else None)
+                    if kind == "chat":
+                        prompt, config, parser, constraint = await self.prepare_chat(public)
+                    else:
+                        prompt, config = self.prepare_completion(public)
+                        parser = constraint = None
+                    self.service.adapter.validate(config)
+                    tokens = tuple(self.real_engine._tokenize_prompt(prompt))
+                    continuation = Continuation(tokens, asdict(config), asdict(parser) if parser else None,
+                                                constraint.to_wire() if constraint else None)
                 entry.task = asyncio.create_task(self.service.prefill(entry, continuation, peer))
                 try:
                     await asyncio.shield(entry.task)
@@ -138,8 +226,15 @@ class Server(ServingServer):
                     entry.cancelled = True
                     await asyncio.shield(entry.task)
                     raise
-                return JSONResponse(dict(request=binding.request, status="ready"))
+                result = dict(request=binding.request, status="ready")
+                if native is not None:
+                    if entry.native is None:
+                        raise RuntimeError("P did not confirm native retention")
+                    result["native"] = entry.native
+                return JSONResponse(result)
             except BaseException as exc:
+                if native is not None and self.service.native_objects is not None:
+                    self.service.native_objects.discard_request(binding.request)
                 if isinstance(exc, asyncio.CancelledError):
                     entry.cancelled = True
                 if entry.error is None:
@@ -154,8 +249,17 @@ class Server(ServingServer):
             if entry.cancelled:
                 raise ValueError("request cancelled")
             continuation = entry.continuation
-            from pypto_serving.config.types import GenerateConfig
             config = GenerateConfig(**continuation.config)
+            if native is not None:
+                final = None
+                async with aclosing(self.service.outputs(binding.request)) as outputs:
+                    async for output in outputs:
+                        if output.finished:
+                            final = output
+                if final is None or final.finish_reason == "error":
+                    raise RuntimeError("D did not produce a successful native result")
+                return JSONResponse(dict(request=binding.request, prompt_token_ids=list(continuation.tokens),
+                    token_ids=list(final.token_ids), text=final.text, finish_reason=final.finish_reason))
             if kind == "chat":
                 response = await self.chat_response(binding.request, public, "", config,
                     OutputParserSpec(**continuation.parser) if continuation.parser else None, None)

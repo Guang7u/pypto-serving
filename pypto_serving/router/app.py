@@ -152,6 +152,10 @@ class ServingRouter:
             self.app.add_api_route(
                 path, self._make_handler(path), methods=["POST"], response_model=None
             )
+        if self.config.is_pd:
+            for suffix in ("tokenize", "generate", "objects/status", "objects/release"):
+                path = "/internal/stateful/v1/" + suffix
+                self.app.add_api_route(path, self._make_handler(path), methods=["POST"], response_model=None)
         # Admin surface. These start processes on other machines, so they are
         # gated on --admin-token when one is configured.
         self.app.add_api_route("/replicas", self._list_replicas, methods=["GET"])

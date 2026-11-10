@@ -1,10 +1,10 @@
 # Copyright (c) PyPTO Contributors.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
-# You may refer to the License for details. You should not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-# LIMITED TO, NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
-# See LICENSE in the root directory of the online documentation for details.
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Local host-staged KV transfer for single-host PD deployments.
 
@@ -137,6 +137,12 @@ class HostTransfer:
         return connection
 
     def write(self, peer, copies):
+        # One socket carries paired frames and ACKs; concurrent callers must
+        # not consume each other's acknowledgements or create competing links.
+        with self.lock:
+            return self._write_locked(peer, copies)
+
+    def _write_locked(self, peer, copies):
         self._check()
         # (source region, destination region, in-region source offset,
         # in-region destination offset, total length) per copy.
@@ -185,10 +191,18 @@ class HostTransfer:
                                 dst_offset=offset, worker_id=region.handle["worker_id"])
 
     @staticmethod
-    def _receive_exact(connection, size):
+    def _receive_exact(connection, size, *, stop_event=None):
         parts = bytearray()
         while len(parts) < size:
-            part = connection.recv(size - len(parts))
+            try:
+                part = connection.recv(size - len(parts))
+            except socket.timeout:
+                # Between frames no write is in flight. Keep the registered
+                # connection across idle turns; partial frames and write ACKs
+                # still time out rather than retrying an uncertain write.
+                if stop_event is not None and not parts and not stop_event.is_set():
+                    continue
+                raise
             if not part:
                 raise EOFError("destination transfer connection closed")
             parts.extend(part)
@@ -210,7 +224,7 @@ class HostTransfer:
 
     def _serve_connection(self, connection):
         while True:
-            header = self._receive_exact(connection, _FRAME.size)
+            header = self._receive_exact(connection, _FRAME.size, stop_event=self.stopped)
             address, length = _FRAME.unpack(header)
             if length > _FRAME_LIMIT:
                 raise ValueError("invalid local transfer frame")

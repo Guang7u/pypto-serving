@@ -58,6 +58,8 @@ class Request:
     admitted: bool = False
     worker_release_ack: asyncio.Event = field(default_factory=asyncio.Event)
     completion_source: str | None = None
+    native_scope: dict | None = None
+    native: dict | None = None
 
 
 class Service:
@@ -76,6 +78,7 @@ class Service:
         self.listener = None
         self.connections = set()
         self.preflight = None
+        self.native_objects = None
 
     async def worker(self, operation, value=None):
         payload = msgspec.msgpack.encode(value) if value is not None else b""
@@ -185,11 +188,15 @@ class Service:
 
     async def cancel_binding(self, binding):
         binding.check(self.node, self.role)
+        if self.native_objects is not None:
+            self.native_objects.validate_binding(binding)
         entry = self.requests.get(binding.request)
         if entry is None:
             # An abort can overtake both the generation POST and control begin.
             # Keep a bounded tombstone without allocating an active request slot.
             self.remember_terminal(binding)
+            if self.native_objects is not None:
+                self.native_objects.discard_request(binding.request, binding=binding)
         else:
             if entry.binding != binding:
                 raise ValueError("abort binding mismatch")
@@ -485,6 +492,8 @@ class Service:
     async def abort(self, entry, stopped=False):
         entry.cancelled = True
         if self.role == "prefill":
+            if self.native_objects is not None:
+                self.native_objects.discard_request(entry.binding.request)
             return
         if stopped:
             entry.source_done.set()
@@ -604,10 +613,16 @@ class Service:
                         await inflight
                         break
                     self.core.scheduler.resume_request(request)
+                if entry.native_scope is not None:
+                    if entry.cancelled:
+                        raise ValueError("request cancelled before native retention")
+                    entry.native = self.native_objects.retain(entry, chunk)
                 self.core.finish_prefilled_request(request)
                 await drain
                 await call("source_done")
             except BaseException as exc:
+                if self.native_objects is not None:
+                    self.native_objects.discard_request(request)
                 if inflight is not None and not inflight.done():
                     try:
                         await asyncio.shield(inflight)
@@ -700,6 +715,8 @@ class Service:
         self.closing = True
         if self.requests or self.pins.active or self.gated:
             raise RuntimeError("node has active/uncertain handoffs; retire it through external orchestration")
+        if self.native_objects is not None:
+            self.native_objects.close()
         if self.role == "prefill":
             await self.worker("release")
             # Session close tells D that every sender owner is unregistered.

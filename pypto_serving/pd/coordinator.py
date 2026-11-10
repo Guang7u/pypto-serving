@@ -19,7 +19,8 @@ import msgspec
 from pydantic import TypeAdapter
 
 from pypto_serving.tools.observe import record
-from .protocol import Binding, MAX_FRAME, Node, VERSION, decode
+from .protocol import Binding, MAX_FRAME, Node, VERSION, decode, digest
+from .stateful import INTERNAL_PREFIX, authorize, owner as native_owner
 from pypto_serving.router.http import (
     SESSION_HEADER, Retirement, RouterError, close_requests, error_response, failure,
     request_headers, response_headers, resolve_session_id, send,
@@ -124,6 +125,8 @@ class PDCoordinator:
         self.active[owner] = None
         session_id = resolve_session_id(request.headers, b"")
         try:
+            if path.startswith(INTERNAL_PREFIX):
+                authorize(request.headers)
             if self.closing:
                 raise RouterError(503, "router_closing", "Router is closing")
             body = await request.body()
@@ -132,6 +135,11 @@ class PDCoordinator:
             if not isinstance(payload, dict):
                 raise ValueError("request must be a JSON object")
             payload["stream"] = _STREAM.validate_python(payload.get("stream", False))
+            if path.startswith(INTERNAL_PREFIX):
+                if payload["stream"]:
+                    raise ValueError("Native requests currently require stream=false")
+                if path != INTERNAL_PREFIX + "generate":
+                    return await self._native_owner_request(request, path, payload, session_id)
             return await self._forward(request, path, owner, payload, session_id)
         except (RouterError, ValueError, RuntimeError, asyncio.TimeoutError, OSError, httpx.HTTPError) as exc:
             error = failure(exc, timeout_code="pd_operation_timeout", protocol_code="pd_protocol_error")
@@ -154,10 +162,49 @@ class PDCoordinator:
             if isinstance(result, BaseException) or result.status_code != 200:
                 logger.warning("HTTP abort not confirmed node=%s result=%s", endpoint.name, result)
 
+    async def _native_owner_request(self, request, path, payload, session_id):
+        if path == INTERNAL_PREFIX + "tokenize":
+            candidates = [n for n in self.nodes.values() if n.role == "prefill"
+                          and n.contract.model == payload.get("model")
+                          and self.registry.state(n.node_id).routable]
+            if not candidates:
+                raise RouterError(503, "native_owner_unavailable", "No healthy P tokenizer is available")
+            node = candidates[0]
+        else:
+            receipt = payload.get("native")
+            if not isinstance(receipt, dict):
+                raise ValueError("native must be an object receipt")
+            node = self.nodes.get(receipt.get("node_id"))
+            if node is None or node.role != "prefill" or not self.registry.state(node.node_id).routable:
+                raise RouterError(503, "native_owner_unavailable", "The native P owner is unavailable")
+            expected = dict(boot=node.boot, registry=node.registry, model=node.contract.model, layout=node.contract.layout)
+            if any(receipt.get(key) != value for key, value in expected.items()):
+                raise RouterError(409, "native_identity_mismatch", "Native object belongs to a different node identity")
+        endpoint = self.registry.state(node.node_id).spec
+        task = asyncio.create_task(self.client.post(endpoint.base_url + path, json=payload,
+            headers=request_headers(request.headers, drop=("content-type", "x-pd-context")),
+            timeout=self._timeout(self.config.handoff_timeout, control=True)))
+
+        async def close_control():
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        retirement = Retirement(self.active, asyncio.current_task(), lambda: None, close_control)
+        try:
+            response = await task
+            retirement.response = response
+            return Response(response.content, status_code=response.status_code,
+                            headers=response_headers(response, session_id, decoded=True))
+        finally:
+            await retirement.wait()
+
     async def _forward(self, request, path, owner, payload, session_id):
         p, d, binding, endpoints, release = self._admit(payload)
         p_task = d_task = response = None
         finished = False
+        native = path == INTERNAL_PREFIX + "generate"
+        native_confirmation = None
         async def before_close():
             if not finished:
                 # Abort wakes D's rendezvous before its HTTP task is joined.
@@ -182,11 +229,25 @@ class PDCoordinator:
         retirement = Retirement(self.active, owner, release_all, before_close)
 
         async def ready():
+            nonlocal native_confirmation
             result = await p_task
             if result.status_code != 200:
                 raise RouterError(result.status_code, "upstream_error", result.text, result)
             try:
-                valid = result.json() == {"request": binding.request, "status": "ready"}
+                value = result.json()
+                if native:
+                    native_confirmation = value.get("native")
+                    expected = dict(native_owner(payload), node_id=p.node_id, boot=p.boot, registry=p.registry,
+                                    model=p.contract.model, layout=p.contract.layout, request_id=binding.request,
+                                    durability="volatile", retained_tokens=len(payload["prompt_token_ids"]) // 128 * 128,
+                                    confirmed_tokens=len(payload["prompt_token_ids"]), block_size=128,
+                                    prefix_digest=digest(payload["prompt_token_ids"][:len(payload["prompt_token_ids"]) // 128 * 128]))
+                    valid = (value.get("request") == binding.request and value.get("status") == "ready"
+                             and isinstance(native_confirmation, dict)
+                             and all(native_confirmation.get(k) == v for k, v in expected.items())
+                             and isinstance(native_confirmation.get("object_id"), str))
+                else:
+                    valid = value == {"request": binding.request, "status": "ready"}
             except ValueError:
                 valid = False
             if not valid:
@@ -224,6 +285,15 @@ class PDCoordinator:
             if not payload.get("stream", False):
                 body = await response.aread()
                 await ready()
+                if native:
+                    value = json.loads(body)
+                    if (not isinstance(value, dict) or value.get("request") != binding.request
+                            or value.get("prompt_token_ids") != payload["prompt_token_ids"]
+                            or not isinstance(value.get("token_ids"), list) or not value["token_ids"]
+                            or any(type(token) is not int or token < 0 for token in value["token_ids"])):
+                        raise ValueError("D returned an invalid native token result")
+                    value["native"] = native_confirmation
+                    body = json.dumps(value).encode()
                 finished = True
                 result = Response(body, headers=response_headers(response, session_id, decoded=True))
                 await retirement.wait()
