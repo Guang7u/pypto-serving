@@ -17,7 +17,7 @@ import time
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Callable
+from typing import Callable, TypedDict
 
 import msgspec
 
@@ -66,6 +66,12 @@ from pypto_serving.tools.profile import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _RequestOptions(TypedDict, total=False):
+    output_parser_spec: OutputParserSpec
+    constraint_spec: ConstraintSpec
+
 
 # How long to wait at each stage of reaping a worker, after the cooperative
 # shutdown command has had its turn. A worker inside a device call cannot be
@@ -1869,7 +1875,7 @@ class AsyncLLMEngine:
         terminal_output_seen = False
         try:
             core = self._cores[replica_idx]
-            request_options = {}
+            request_options: _RequestOptions = {}
             if output_parser_spec is not None:
                 request_options["output_parser_spec"] = output_parser_spec
             if constraint_spec is not None:
