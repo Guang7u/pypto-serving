@@ -9,7 +9,7 @@
 """Volatile Qwen3 complete-page ownership, independent of request/transfer pins.
 
 This module has no model-loading dependency: Router uses its credential check.
-Only the P owner can issue receipts, after retaining its confirmed cache pages.
+The cache owner issues receipts only after retaining its confirmed cache pages.
 """
 
 import hashlib

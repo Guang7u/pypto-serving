@@ -205,6 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Serving
+    parser.add_argument("--session-kv-mode", choices=("input", "input-output"), default="input",
+                        help="Native session KV retention boundary (default: input).")
+    parser.add_argument("--enable-native-sessions", action="store_true",
+                        help="Enable authenticated native sessions on a single-rank Qwen3 server.")
     parser.add_argument("--pd-role", choices=("prefill", "decode"), default=None)
     parser.add_argument("--pd-config", default=None, help="Shared PD deployment JSON.")
     parser.add_argument("--pd-node-id", default=None, help="Select a node when its role has multiple endpoints.")
@@ -270,6 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
+    if args.session_kv_mode != "input":
+        raise ValueError("Native input-output session mode is not supported by this deployment")
     _validate_backend(args.backend)
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
@@ -278,6 +284,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if args.enable_native_sessions and (model_family != "qwen" or len(devices) != 1 or args.prompt):
+        raise ValueError("Native sessions require a single-rank Qwen3 serving deployment")
     if args.max_num_seqs is None:
         if args.pd_role:
             from pypto_serving.pd.config import default_max_num_seqs
@@ -512,10 +520,10 @@ def _build_runtime_config(
         requires_homogeneous_prefill_decode = bool(
             kernel_contract.requires_homogeneous_prefill_decode
         )
-    elif model_family == "qwen" and args.pd_role:
+    elif model_family == "qwen" and (args.pd_role or args.enable_native_sessions):
         from pypto_serving.model.qwen.npu_executor import _QWEN14B_PAGE_SIZE
 
-        # PD routes one scheduler-visible cache group over the runner's fused
+        # Native sessions and PD share one cache group over the runner's fused
         # key/value page pools: physical bytes per (layer, block) cover both.
         if args.block_size != _QWEN14B_PAGE_SIZE:
             raise ValueError(
@@ -878,6 +886,7 @@ def run_serve(
     *,
     host: str = "0.0.0.0",
     port: int = 8000,
+    native_sessions: bool = False,
 ) -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -898,12 +907,20 @@ def run_serve(
         initially_active=False,
     )
     tokenizer = load_tokenizer(config.model_dir)
-    async_engine = AsyncLLMEngine(
-        config=config,
-        tokenizer=tokenizer
-    )
-
-    app = create_serving_app(async_engine, model_id, generate_config)
+    native_server = None
+    if native_sessions:
+        from functools import partial
+        from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
+        from pypto_serving.serving.server.native import NativeServer, SessionScheduler
+        if not os.getenv("PYPTO_STATEFUL_INTERNAL_TOKEN"):
+            raise ValueError("Native sessions require PYPTO_STATEFUL_INTERNAL_TOKEN")
+        async_engine = AsyncLLMEngine(config=config, tokenizer=tokenizer,
+            core_factory=partial(ReplicaEngineCore, scheduler_factory=SessionScheduler))
+        native_server = NativeServer(async_engine, model_id, generate_config)
+        app = native_server.app
+    else:
+        async_engine = AsyncLLMEngine(config=config, tokenizer=tokenizer)
+        app = create_serving_app(async_engine, model_id, generate_config)
 
     @app.on_event("startup")
     async def startup():
@@ -911,6 +928,8 @@ def run_serve(
 
     @app.on_event("shutdown")
     async def shutdown():
+        if native_server is not None and native_server.objects is not None:
+            native_server.objects.close()
         await async_engine.stop()
         merge_profile()
 
@@ -1130,6 +1149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             generate_config,
             host=args.host,
             port=args.port,
+            native_sessions=args.enable_native_sessions,
         )
     return 0
 

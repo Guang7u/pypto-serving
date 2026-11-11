@@ -219,3 +219,27 @@ def test_worker_only_exports_explicit_build_directory(monkeypatch, requested):
     directory = worker._configure_pypto_build_dir((3, 4))
     assert directory == (Path(requested) / "serving_dp2_d3_4" if requested else None)
     assert os.environ.get("PYPTO_PROG_BUILD_DIR") == (str(directory) if requested else requested)
+
+
+def test_session_kv_mode_defaults_to_input_and_rejects_unimplemented_output(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    args = _parse_cli_args(["--model", str(model)])
+    assert args.session_kv_mode == "input"
+    for role in (None, "prefill", "decode"):
+        options = ["--model", str(model), "--session-kv-mode", "input-output"]
+        if role:
+            options += ["--pd-role", role]
+        with pytest.raises(ValueError, match="input-output"):
+            cli.build_serving_engine_config(_parse_cli_args(options))
+
+
+def test_native_single_uses_the_real_qwen_grouped_cache_without_a_pd_role(tmp_path, monkeypatch):
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setenv("PYPTO_STATEFUL_INTERNAL_TOKEN", "native-single-contract-credential")
+    args = _parse_cli_args(["--model", str(model), "--max-model-len", "512", "--enable-native-sessions"])
+    config = cli.build_serving_engine_config(args)
+    assert args.pd_role is None
+    assert [g.name for g in config.runtime_config.kv_cache_groups] == ["kv"]
+    assert config.runtime_config.kv_cache_groups[0].spec.token_capacity == 128
