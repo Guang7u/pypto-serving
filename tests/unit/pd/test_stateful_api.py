@@ -272,3 +272,56 @@ def test_live_native_mount_attaches_parent_pages_before_scheduling_suffix():
     assert objects.status(receipt)["free_blocks"] == 15
     objects.release(receipt)
     assert objects.cache.group_num_free_blocks("kv", 0) == 16
+
+
+def test_computed_output_pages_replace_the_private_pin_and_mount_only_the_real_prefix():
+    from dataclasses import replace
+    import msgspec
+    from types import SimpleNamespace
+    from pypto_serving.pd.stateful import NativeObjects
+    from pypto_serving.router.http import RouterError
+
+    original, p, d = native_owner()
+    objects = NativeObjects(original.cache, msgspec.structs.replace(p, role="single"), SimpleNamespace(active={}),
+                            session_kv_mode="input-output")
+    entry, first = native_request(objects, p, d)
+    initial_free = objects.cache.group_num_free_blocks("kv", 0) + 2
+    receipt = objects.retain(entry, first)
+    assert receipt["retained_tokens"] == 128
+    actual = tuple(range(147)) + tuple(range(1000, 1109))
+    tables = objects.cache.ensure_group_blocks(entry.binding.request, 257, partition=0)
+    receipt2 = objects.retain(entry, replace(first, end=256, blocks=tables), computed_tokens=actual)
+    assert receipt2["retained_tokens"] == receipt2["confirmed_tokens"] == 256
+    assert not objects.status(receipt)["live"]
+    assert objects.status(receipt2)["session_references"] == 1
+    child = list(actual[:240]) + [9999] * 30
+    mounted = objects.mount(receipt2, entry.native_scope, child, mount_tokens=128)
+    assert mounted.token_count == 128
+    assert len(mounted.block_ids["kv"]) == 1
+    with pytest.raises(RouterError, match="prefix"):
+        objects.mount(receipt2, entry.native_scope, child, mount_tokens=256)
+    with pytest.raises(RouterError):
+        objects.mount(receipt2, dict(entry.native_scope, tenant_id="other"), child, mount_tokens=0)
+    objects.cache.release_all_group_requests(entry.binding.request)
+    assert objects.status(receipt2)["live"]
+    objects.release(receipt2)
+    assert objects.cache.group_num_free_blocks("kv", 0) == initial_free
+
+
+def test_prepared_single_prompt_cannot_be_mutated_to_bypass_prefix_validation():
+    import copy
+    from pypto_serving.router.http import RouterError
+
+    objects, _, _ = native_owner()
+    prepared = dict(model="Qwen3-14B", layout="layout", prompt_token_ids=[11, 12, 13],
+                    generation={"max_new_tokens": 4}, parser=None, constraint=None,
+                    parallel_tool_calls=True, model_identity={"fingerprint": "actual"},
+                    rendering={"template_digest": "selected"}, session_kv_mode="input")
+    signed = objects.seal_prepared(prepared)
+    objects.check_prepared(dict(signed, tenant_id="tenant", parent={"object_id": "separate-scope-check"}))
+    for field, value in [("prompt_token_ids", [99, 12, 13]), ("generation", {"max_new_tokens": 5}),
+                         ("rendering", {"template_digest": "different"})]:
+        damaged = copy.deepcopy(signed)
+        damaged[field] = value
+        with pytest.raises(RouterError):
+            objects.check_prepared(damaged)

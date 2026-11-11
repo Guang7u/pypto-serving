@@ -221,7 +221,7 @@ def test_worker_only_exports_explicit_build_directory(monkeypatch, requested):
     assert os.environ.get("PYPTO_PROG_BUILD_DIR") == (str(directory) if requested else requested)
 
 
-def test_session_kv_mode_defaults_to_input_and_rejects_unimplemented_output(tmp_path):
+def test_session_kv_mode_defaults_to_input_and_rejects_output_without_native(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
     args = _parse_cli_args(["--model", str(model)])
@@ -243,3 +243,19 @@ def test_native_single_uses_the_real_qwen_grouped_cache_without_a_pd_role(tmp_pa
     assert args.pd_role is None
     assert [g.name for g in config.runtime_config.kv_cache_groups] == ["kv"]
     assert config.runtime_config.kv_cache_groups[0].spec.token_capacity == 128
+
+
+def test_output_retention_mode_is_a_single_native_startup_option(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    argv = ["--model", str(model), "--enable-native-sessions", "--session-kv-mode", "input-output"]
+    args = _parse_cli_args(argv)
+    config = cli.build_serving_engine_config(args)
+    assert args.session_kv_mode == "input-output"
+    assert args.pd_role is None
+    for invalid in (["--pd-role", "prefill"], ["--pd-role", "decode"]):
+        with pytest.raises(ValueError, match="single native"):
+            cli.build_serving_engine_config(_parse_cli_args(argv + invalid))
+    with pytest.raises(ValueError, match="single native"):
+        cli.build_serving_engine_config(_parse_cli_args([
+            "--model", str(model), "--session-kv-mode", "input-output"]))

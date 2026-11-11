@@ -50,6 +50,7 @@ class _Object:
     blocks: dict
     partition: int
     binding: Binding
+    tokens: tuple[int, ...]
 
 
 class NativeObjects:
@@ -60,10 +61,13 @@ class NativeObjects:
     unbounded table of released objects or reuse of bare block IDs as identity.
     """
 
-    def __init__(self, cache, node, pins, model_identity=None):
+    def __init__(self, cache, node, pins, model_identity=None, *, session_kv_mode="input"):
         if (node.contract.adapter != "qwen3-14b-paged" or cache.group_names != ("kv",)
                 or cache.group_specs[0].spec.token_capacity != 128):
             raise ValueError("Stateful retention requires the Qwen3-14B paged layout")
+        if session_kv_mode not in {"input", "input-output"} or (session_kv_mode == "input-output" and node.role != "single"):
+            raise ValueError("Output retention requires a single native owner")
+        self.session_kv_mode = session_kv_mode
         self.cache, self.node, self.pins = cache, node, pins
         self.model_identity = model_identity
         self.secret = secrets.token_bytes(32)
@@ -73,11 +77,33 @@ class NativeObjects:
     def _signature(self, receipt, nonce):
         return hmac.new(self.secret, (nonce + ":" + digest(receipt)).encode(), hashlib.sha256).hexdigest()
 
-    def retain(self, entry, chunk):
-        if entry.binding.request in self.requests:
-            raise RuntimeError("Request already owns a native object")
-        if not chunk.final or chunk.end != len(entry.continuation.tokens):
-            raise ValueError("Native retain requires the confirmed final prompt chunk")
+    def seal_prepared(self, prepared):
+        fields = ("model", "layout", "prompt_token_ids", "generation", "parser", "constraint",
+                  "parallel_tool_calls", "model_identity", "rendering", "session_kv_mode")
+        payload = {key: prepared.get(key) for key in fields}
+        signature = hmac.new(self.secret, b"native-prepared-v1\0" + digest(payload).encode(),
+                             hashlib.sha256).hexdigest()
+        return dict(prepared, prepared_signature=signature)
+
+    def check_prepared(self, prepared):
+        signature = prepared.get("prepared_signature")
+        expected = self.seal_prepared(prepared)["prepared_signature"]
+        if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+            raise RouterError(409, "native_prepared_mismatch", "Native prepared prompt was changed or belongs to an old boot")
+
+    def retain(self, entry, chunk, *, computed_tokens=None):
+        previous = self.requests.get(entry.binding.request)
+        if previous is not None:
+            if self.session_kv_mode != "input-output":
+                raise RuntimeError("Request already owns a native object")
+            self.validate_binding(entry.binding)
+        actual = tuple(entry.continuation.tokens) if computed_tokens is None else tuple(computed_tokens)
+        if (not chunk.final or chunk.end != len(actual)
+                or (computed_tokens is not None and self.session_kv_mode != "input-output")
+                or actual[:len(entry.continuation.tokens)] != tuple(entry.continuation.tokens)):
+            raise ValueError("Native retain requires the confirmed prompt or computed output prefix")
+        if previous is not None and chunk.end // 128 <= self.objects[previous].receipt["retained_tokens"] // 128:
+            return dict(self.objects[previous].receipt)
         boundary = chunk.end // 128 * 128
         tables = {"kv": list(chunk.blocks["kv"][:boundary // 128])}
         if len(tables["kv"]) != boundary // 128:
@@ -86,7 +112,9 @@ class NativeObjects:
                        registry=self.node.registry, model=self.node.contract.model, layout=self.node.contract.layout,
                        request_id=entry.binding.request, partition=chunk.partition,
                        durability="volatile", retained_tokens=boundary, confirmed_tokens=chunk.end,
-                       block_size=128, prefix_digest=digest(list(entry.continuation.tokens[:boundary])))
+                       block_size=128, prefix_digest=digest(list(actual[:boundary])))
+        if self.session_kv_mode == "input-output":
+            receipt["session_kv_mode"] = self.session_kv_mode
         if self.model_identity is not None:
             receipt["model_identity_digest"] = self.model_identity
         if getattr(entry, "native_parent", None) is not None:
@@ -97,14 +125,20 @@ class NativeObjects:
             nonce = uuid.uuid4().hex
             key = nonce + "." + self._signature(receipt, nonce)
             receipt["object_id"] = key
-            self.objects[key] = _Object(receipt, tables, chunk.partition, entry.binding)
+            self.objects[key] = _Object(receipt, tables, chunk.partition, entry.binding, actual[:boundary])
             self.requests[entry.binding.request] = key
         except BaseException:
             if key is not None:
                 self.objects.pop(key, None)
-                self.requests.pop(entry.binding.request, None)
+                if previous is None:
+                    self.requests.pop(entry.binding.request, None)
+                else:
+                    self.requests[entry.binding.request] = previous
             self.cache.release_group_block_snapshot(tables, chunk.partition)
             raise
+        if previous is not None:
+            old = self.objects.pop(previous)
+            self.cache.release_group_block_snapshot(old.blocks, old.partition)
         return dict(receipt)
 
     def _check(self, receipt):
@@ -144,7 +178,7 @@ class NativeObjects:
             self.requests.pop(record.receipt["request_id"], None)
         return self.status(receipt)
 
-    def mount(self, receipt, scope, tokens):
+    def mount(self, receipt, scope, tokens, *, mount_tokens=None):
         from pypto_serving.serving.memory.kv_cache import ConfirmedGroupPrefix
 
         key = self._check(receipt)
@@ -154,10 +188,21 @@ class NativeObjects:
         if any(receipt.get(field) != scope[field] for field in ("tenant_id", "cache_salt_digest")):
             raise RouterError(403, "native_owner_mismatch", "The parent native object has a different owner")
         boundary = receipt["retained_tokens"]
-        if boundary >= len(tokens) or digest(list(tokens[:boundary])) != receipt["prefix_digest"]:
-            raise RouterError(409, "native_prefix_mismatch", "Prompt differs from the confirmed parent prefix")
+        if mount_tokens is None:
+            if boundary >= len(tokens) or digest(list(tokens[:boundary])) != receipt["prefix_digest"]:
+                raise RouterError(409, "native_prefix_mismatch", "Prompt differs from the confirmed parent prefix")
+        else:
+            common = 0
+            for old, new in zip(record.tokens, tokens):
+                if old != new:
+                    break
+                common += 1
+            expected = min(common, max(0, len(tokens) - 1)) // 128 * 128
+            if type(mount_tokens) is not int or mount_tokens != expected:
+                raise RouterError(409, "native_prefix_mismatch", "Requested mount differs from the actual longest prefix")
+            boundary = mount_tokens
         return ConfirmedGroupPrefix(
-            boundary, record.partition, {name: tuple(ids) for name, ids in record.blocks.items()},
+            boundary, record.partition, {name: tuple(ids[:boundary // 128]) for name, ids in record.blocks.items()},
         )
 
     def validate_binding(self, binding):

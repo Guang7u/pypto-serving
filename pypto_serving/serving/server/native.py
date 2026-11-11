@@ -44,8 +44,9 @@ class SessionScheduler(Scheduler):
     continues to own request execution and retirement.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, session_kv_mode="input", **kwargs):
         super().__init__(**kwargs)
+        self.session_kv_mode = session_kv_mode
         self.native_requests = {}
         self.native_objects = None
 
@@ -53,29 +54,45 @@ class SessionScheduler(Scheduler):
         for scheduled in output.scheduled_requests:
             request = scheduled.request
             entry = self.native_requests.get(request.request_id)
-            if (entry is None or entry.native is not None or entry.error is not None
-                    or request.status.is_finished or request.status is RequestStatus.PREEMPTED
-                    or not scheduled.is_prefill
-                    or scheduled.num_computed_tokens + scheduled.num_new_tokens < request.num_prompt_tokens):
+            if (entry is None or entry.error is not None
+                    or request.status.is_finished or request.status is RequestStatus.PREEMPTED):
                 continue
-            # The snapshot is exactly the table whose successful device result
-            # the engine is consuming; optimistic counters are not confirmation.
+            end = scheduled.num_computed_tokens + scheduled.num_new_tokens
+            if end < request.num_prompt_tokens:
+                continue
+            if self.session_kv_mode == "input" and (entry.native is not None or not scheduled.is_prefill):
+                continue
+            # Consume only this successful device ACK. The token sampled by
+            # this very step has no KV yet and is not in request.output_token_ids.
             try:
+                computed = None
+                if self.session_kv_mode == "input-output":
+                    known = request.prompt_token_ids + request.output_token_ids
+                    if end > len(known):
+                        raise RuntimeError("Device ACK exceeds the known computed token prefix")
+                    computed = known[:end]
+                else:
+                    end = request.num_prompt_tokens
                 entry.native = self.native_objects.retain(entry, SimpleNamespace(
-                    final=True, end=request.num_prompt_tokens,
-                    blocks=scheduled.block_ids_by_group, partition=scheduled.cache_partition))
+                    final=True, end=end, blocks=scheduled.block_ids_by_group,
+                    partition=scheduled.cache_partition), computed_tokens=computed)
             except Exception as exc:
                 entry.error = exc
         return super().update_from_output(output, tokens)
 
 
 class NativeServer(ServingServer):
-    def __init__(self, engine, model_id, generate):
+    def __init__(self, engine, model_id, generate, *, session_kv_mode="input"):
         self.core = engine.single_core()
         if (len(engine.config.worker_device_ids()) != 1
                 or not isinstance(self.core.scheduler, SessionScheduler)
                 or engine.config.executor_cls != "PyptoQwen14BExecutor"):
             raise ValueError("Native single deployment requires the Qwen3 single-rank engine")
+        self.session_kv_mode = session_kv_mode
+        if session_kv_mode != self.core.scheduler.session_kv_mode:
+            raise ValueError("Server and scheduler session mode differ")
+        if session_kv_mode == "input-output" and engine.config.resolve_runtime_config().num_speculative_tokens:
+            raise ValueError("Native output retention requires ordinary Qwen3 decoding")
         self.boot = uuid.uuid4().hex
         self.model_identity = load_model_identity(engine.config.model_dir, model_id, engine.tokenizer)
         self.objects = None
@@ -102,11 +119,13 @@ class NativeServer(ServingServer):
             cache = self.core.kv_cache_manager
             runtime = self.engine.config.resolve_runtime_config()
             contract = Contract("qwen3-14b-paged", self.model_id,
-                digest(dict(deployment="single", runtime=asdict(runtime), groups=[asdict(s) for s in cache.group_specs])),
+                digest(dict(deployment="single", session_kv_mode=self.session_kv_mode,
+                            runtime=asdict(runtime), groups=[asdict(s) for s in cache.group_specs])),
                 (Component("key", "kv", "kv"), Component("value", "kv", "kv")))
             node = Node("single", "single", self.boot, contract, uuid.uuid4().hex, Topology.for_tp(1, 1),
                         provider="local", prefix=cache.enable_prefix_cache)
-            self.objects = NativeObjects(cache, node, SimpleNamespace(active={}), self.model_identity["fingerprint"])
+            self.objects = NativeObjects(cache, node, SimpleNamespace(active={}), self.model_identity["fingerprint"],
+                                         session_kv_mode=self.session_kv_mode)
             self.core.scheduler.native_objects = self.objects
         return self.objects
 
@@ -122,7 +141,7 @@ class NativeServer(ServingServer):
             raise ValueError("model differs from the single owner")
         node = objects.node
         return JSONResponse(dict(backend="pypto", model=self.model_id, layout=node.contract.layout,
-            node_id=node.node_id, boot=node.boot, registry=node.registry, deployment="single", session_kv_mode="input",
+            node_id=node.node_id, boot=node.boot, registry=node.registry, deployment="single", session_kv_mode=self.session_kv_mode,
             block_size=128, durability="volatile", max_model_len=self.engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
             native_mount=True, streaming=False, tools=False, durable=False,
@@ -141,10 +160,11 @@ class NativeServer(ServingServer):
             raise ValueError("Native generation requires a non-empty prompt")
         tokens = list(encoded)
         self._budget(tokens, config)
-        return JSONResponse(dict(model=self.model_id, layout=objects.node.contract.layout,
+        return JSONResponse(objects.seal_prepared(dict(model=self.model_id, layout=objects.node.contract.layout,
             prompt_token_ids=tokens, generation=asdict(config), parser=asdict(parser) if parser else None,
             constraint=constraint.to_wire() if constraint else None, parallel_tool_calls=public.parallel_tool_calls,
-            model_identity=self.model_identity, rendering=self.rendering_profile(public)))
+            model_identity=self.model_identity, rendering=self.rendering_profile(public),
+            session_kv_mode=self.session_kv_mode)))
 
     def _budget(self, tokens, config):
         if len(tokens) + config.max_new_tokens > self.engine.config.resolve_runtime_config().max_seq_len:
@@ -185,8 +205,11 @@ class NativeServer(ServingServer):
         constraint = ConstraintSpec.from_wire(raw["constraint"]) if raw.get("constraint") else None
         if constraint is not None:
             await self._preflight_constraint(constraint)
+        objects.check_prepared(raw)
+        if raw.get("session_kv_mode") != self.session_kv_mode:
+            raise RouterError(409, "native_identity_mismatch", "Session mode differs from the configured owner")
         parent = raw.get("parent")
-        prefix = objects.mount(parent, scope, tokens) if parent is not None else None
+        prefix = objects.mount(parent, scope, tokens, mount_tokens=raw.get("mount_tokens")) if parent is not None else None
         rid = "single-" + uuid.uuid4().hex
         entry = SimpleNamespace(binding=SingleBinding(rid, digest(raw)), native_scope=scope,
             continuation=Continuation(tuple(tokens), asdict(config), None, None), native_parent=parent,

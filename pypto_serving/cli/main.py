@@ -274,8 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
-    if args.session_kv_mode != "input":
-        raise ValueError("Native input-output session mode is not supported by this deployment")
+    if args.session_kv_mode != "input" and (not args.enable_native_sessions or args.pd_role):
+        raise ValueError("Native input-output retention requires a single native deployment")
     _validate_backend(args.backend)
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
@@ -887,6 +887,7 @@ def run_serve(
     host: str = "0.0.0.0",
     port: int = 8000,
     native_sessions: bool = False,
+    session_kv_mode: str = "input",
 ) -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -915,8 +916,9 @@ def run_serve(
         if not os.getenv("PYPTO_STATEFUL_INTERNAL_TOKEN"):
             raise ValueError("Native sessions require PYPTO_STATEFUL_INTERNAL_TOKEN")
         async_engine = AsyncLLMEngine(config=config, tokenizer=tokenizer,
-            core_factory=partial(ReplicaEngineCore, scheduler_factory=SessionScheduler))
-        native_server = NativeServer(async_engine, model_id, generate_config)
+            core_factory=partial(ReplicaEngineCore, scheduler_factory=partial(
+                SessionScheduler, session_kv_mode=session_kv_mode)))
+        native_server = NativeServer(async_engine, model_id, generate_config, session_kv_mode=session_kv_mode)
         app = native_server.app
     else:
         async_engine = AsyncLLMEngine(config=config, tokenizer=tokenizer)
@@ -1150,6 +1152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             native_sessions=args.enable_native_sessions,
+            session_kv_mode=args.session_kv_mode,
         )
     return 0
 
