@@ -20,6 +20,14 @@ from tests.unit.pd.test_coordination import config
 
 
 def test_native_stream_forwards_delta_before_save_ack_and_guards_terminal(monkeypatch):
+    verify_native_stream_barrier(monkeypatch, tools=False)
+
+
+def test_native_tool_delta_precedes_save_ack_but_terminal_waits(monkeypatch):
+    verify_native_stream_barrier(monkeypatch, tools=True)
+
+
+def verify_native_stream_barrier(monkeypatch, tools):
     from starlette.requests import Request
     from tests.unit.pd.test_coordination import Peers, assert_idle
     from pypto_serving.pd.stateful import digest, owner
@@ -50,6 +58,11 @@ def test_native_stream_forwards_delta_before_save_ack_and_guards_terminal(monkey
             delta = dict(request=binding["request"], delta="answer")
             terminal = dict(request=binding["request"], prompt_token_ids=payload["prompt_token_ids"],
                             token_ids=[42], text="answer", finish_reason="stop")
+            if tools:
+                delta.update(delta="", tool_calls=[{"index": 0, "id": "call-weather", "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Oslo"}'}}])
+                terminal.update(text="", tool_calls=[{"id": "call-weather", "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Oslo"}'}}])
             return httpx.Response(200, text="".join(
                 "data: " + json.dumps(value) + "\n\n" for value in (delta, terminal)) + "data: [DONE]\n\n",
                 headers={"Content-Type": "text/event-stream"})
@@ -72,7 +85,12 @@ def test_native_stream_forwards_delta_before_save_ack_and_guards_terminal(monkey
             response = await router.proxy.forward(incoming, "/internal/stateful/v1/generate")
             assert response.status_code == 200, response.body
             first = await anext(response.body_iterator)
-            assert json.loads(first.removeprefix("data: "))["delta"] == "answer"
+            value = json.loads(first.removeprefix("data: "))
+            if tools:
+                assert value["tool_calls"] == [{"index": 0, "id": "call-weather", "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Oslo"}'}}]
+            else:
+                assert value["delta"] == "answer"
             pending = asyncio.create_task(anext(response.body_iterator))
             await asyncio.sleep(0)
             await asyncio.sleep(0)
@@ -81,6 +99,8 @@ def test_native_stream_forwards_delta_before_save_ack_and_guards_terminal(monkey
             terminal = json.loads((await pending).removeprefix("data: "))
             assert terminal["native"]["object_id"] == "external-owner-receipt"
             assert terminal["token_ids"] == [42]
+            if tools:
+                assert terminal["tool_calls"][0]["id"] == "call-weather"
             assert "".join([chunk async for chunk in response.body_iterator]) == "data: [DONE]\n\n"
             assert_idle(router)
 

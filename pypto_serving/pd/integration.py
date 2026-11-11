@@ -30,7 +30,9 @@ from pypto_serving.router.http import RouterError
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.sched.scheduler import Scheduler
-from pypto_serving.serving.server.server import ChatCompletionRequest, CompletionRequest, ServingServer
+from pypto_serving.serving.server.server import (
+    ChatCompletionRequest, CompletionRequest, FunctionCall, ServingServer, ToolCall,
+)
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
@@ -118,7 +120,7 @@ class Server(ServingServer):
             node_id=node.node_id, boot=node.boot, registry=node.registry, block_size=128, durability="volatile",
             max_model_len=self.real_engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
-            native_mount=True, streaming=True, tools=False, durable=False,
+            native_mount=True, streaming=True, tools=True, durable=False,
             ordinary_prefix_cache=self.service.cache.enable_prefix_cache))
 
     async def native_cancel(self, request: HTTPRequest):
@@ -146,7 +148,8 @@ class Server(ServingServer):
         self.service.adapter.validate(config)
         return JSONResponse(dict(model=self.service.node.contract.model, layout=self.service.node.contract.layout,
             prompt_token_ids=list(self.real_engine._tokenize_prompt(prompt)), generation=asdict(config),
-            parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None))
+            parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None,
+            parallel_tool_calls=public.parallel_tool_calls))
 
     async def native_generate(self, request: HTTPRequest):
         authorize(request.headers)
@@ -188,6 +191,8 @@ class Server(ServingServer):
         self.service.adapter.validate(config)
         if type(raw.get("stream", False)) is not bool or raw.get("stream", False) != config.stream:
             raise ValueError("Native stream flag differs from generation configuration")
+        if type(raw.get("parallel_tool_calls", True)) is not bool:
+            raise ValueError("Native parallel_tool_calls must be a boolean")
         if len(tokens) + config.max_new_tokens > self.real_engine.config.resolve_runtime_config().max_seq_len:
             raise ValueError("Native generation requires a bounded context/output budget")
         if constraint is not None:
@@ -283,9 +288,15 @@ class Server(ServingServer):
             continuation = entry.continuation
             config = GenerateConfig(**continuation.config)
             if native is not None:
+                parallel = raw.get("parallel_tool_calls", True)
+
                 def result(output):
+                    calls = output.tool_calls if parallel else output.tool_calls[:1]
                     return dict(request=binding.request, prompt_token_ids=list(continuation.tokens),
-                                token_ids=list(output.token_ids), text=output.text, finish_reason=output.finish_reason)
+                                token_ids=list(output.token_ids), text=output.text, finish_reason=output.finish_reason,
+                                chat_finish_reason=self._chat_finish_reason(output), reasoning=output.reasoning,
+                                tool_calls=[ToolCall(id=call.id, function=FunctionCall(
+                                    name=call.name, arguments=call.arguments)).model_dump() for call in calls])
 
                 if config.stream:
                     async def native_stream():
@@ -293,9 +304,13 @@ class Server(ServingServer):
                         try:
                             async with aclosing(self.service.outputs(binding.request)) as outputs:
                                 async for output in outputs:
-                                    if output.text_delta:
+                                    tool_deltas = [self._tool_delta(item).model_dump(exclude_none=True)
+                                                   for item in output.tool_call_deltas
+                                                   if parallel or item.index == 0]
+                                    if output.text_delta or output.reasoning_delta or tool_deltas:
                                         yield "data: " + json.dumps(
-                                            dict(request=binding.request, delta=output.text_delta)) + "\n\n"
+                                            dict(request=binding.request, delta=output.text_delta,
+                                                 reasoning=output.reasoning_delta, tool_calls=tool_deltas)) + "\n\n"
                                     if output.finished:
                                         if output.finish_reason == "error":
                                             raise RuntimeError("D did not produce a successful native result")
