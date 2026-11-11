@@ -41,7 +41,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
+    from pydantic import AliasChoices, BaseModel, Field, field_validator, model_serializer, model_validator
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -90,7 +90,7 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: str | None = None
-    reasoning: str | None = None
+    reasoning: str | None = Field(default=None, validation_alias=AliasChoices("reasoning", "reasoning_content"))
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
 

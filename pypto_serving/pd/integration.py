@@ -34,6 +34,7 @@ from pypto_serving.serving.server.server import (
     ChatCompletionRequest, CompletionRequest, FunctionCall, ServingServer, ToolCall,
 )
 from pypto_serving.serving.server.serving_worker import spawn_worker
+from pypto_serving.serving.server.model_identity import load_model_identity
 from .adapter import select_adapter
 from .config import Config, log_context
 from .protocol import Binding, Continuation, Node, decode
@@ -68,7 +69,8 @@ class PrefillCore(ReplicaEngineCore):
 
 
 class Server(ServingServer):
-    def __init__(self, service, engine, generate):
+    def __init__(self, service, engine, generate, model_identity=None):
+        self.model_identity = model_identity
         self.service, self.real_engine = service, engine
         facade = SimpleNamespace(config=engine.config, tokenizer=engine.tokenizer, metrics=engine.metrics,
                                  add_request=service.outputs, start_profile=engine.start_profile,
@@ -104,7 +106,10 @@ class Server(ServingServer):
         if self.service.role != "prefill":
             raise ValueError("Native objects belong to the P owner")
         if self.service.native_objects is None:
-            self.service.native_objects = NativeObjects(self.service.cache, self.service.node, self.service.pins)
+            if self.model_identity is None:
+                raise NodeUnavailable("Native model identity is unavailable")
+            self.service.native_objects = NativeObjects(self.service.cache, self.service.node, self.service.pins,
+                                                       self.model_identity["fingerprint"])
         return self.service.native_objects
 
     async def native_capabilities(self, request: HTTPRequest):
@@ -121,7 +126,7 @@ class Server(ServingServer):
             max_model_len=self.real_engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
             native_mount=True, streaming=True, tools=True, durable=False,
-            ordinary_prefix_cache=self.service.cache.enable_prefix_cache))
+            ordinary_prefix_cache=self.service.cache.enable_prefix_cache, model_identity=self.model_identity))
 
     async def native_cancel(self, request: HTTPRequest):
         authorize(request.headers)
@@ -152,7 +157,7 @@ class Server(ServingServer):
         return JSONResponse(dict(model=self.service.node.contract.model, layout=self.service.node.contract.layout,
             prompt_token_ids=tokens, generation=asdict(config),
             parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None,
-            parallel_tool_calls=public.parallel_tool_calls))
+            parallel_tool_calls=public.parallel_tool_calls, model_identity=self.model_identity))
 
     async def native_generate(self, request: HTTPRequest):
         authorize(request.headers)
@@ -172,6 +177,8 @@ class Server(ServingServer):
 
     async def prepare_native(self, raw):
         node = self.service.node
+        if raw.get("model_identity") != self.model_identity or self.model_identity is None:
+            raise RouterError(409, "model_identity_mismatch", "Native generation checkpoint identity differs")
         if raw.get("model") != node.contract.model or raw.get("layout") != node.contract.layout:
             raise ValueError("Native generation model/layout mismatch")
         if raw.get("parent") is not None and not isinstance(raw["parent"], dict):
@@ -393,7 +400,9 @@ class Application:
         self.service = Service(config, endpoint, role, self.adapter, self.core, progress)
         if role == "prefill":
             self.core.publish = self.wrap_results()
-        self.server = Server(self.service, self.engine, generate)
+        identity = load_model_identity(engine_config.model_dir, engine_config.model_id, tokenizer) if (
+            os.getenv("PYPTO_STATEFUL_INTERNAL_TOKEN")) else None
+        self.server = Server(self.service, self.engine, generate, identity)
         self.app = self.server.app
         self.app.router.lifespan_context = self.lifespan
 

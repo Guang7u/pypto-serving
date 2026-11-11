@@ -27,6 +27,7 @@ from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.sched.scheduler import RequestStatus, Scheduler
 from .server import ChatCompletionRequest, FunctionCall, ServingServer, ToolCall
+from .model_identity import load_model_identity
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class NativeServer(ServingServer):
                 or engine.config.executor_cls != "PyptoQwen14BExecutor"):
             raise ValueError("Native single deployment requires the Qwen3 single-rank engine")
         self.boot = uuid.uuid4().hex
+        self.model_identity = load_model_identity(engine.config.model_dir, model_id, engine.tokenizer)
         self.objects = None
         super().__init__(engine, model_id, generate)
 
@@ -104,7 +106,7 @@ class NativeServer(ServingServer):
                 (Component("key", "kv", "kv"), Component("value", "kv", "kv")))
             node = Node("single", "single", self.boot, contract, uuid.uuid4().hex, Topology.for_tp(1, 1),
                         provider="local", prefix=cache.enable_prefix_cache)
-            self.objects = NativeObjects(cache, node, SimpleNamespace(active={}))
+            self.objects = NativeObjects(cache, node, SimpleNamespace(active={}), self.model_identity["fingerprint"])
             self.core.scheduler.native_objects = self.objects
         return self.objects
 
@@ -124,7 +126,7 @@ class NativeServer(ServingServer):
             block_size=128, durability="volatile", max_model_len=self.engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
             native_mount=True, streaming=False, tools=False, durable=False,
-            ordinary_prefix_cache=objects.cache.enable_prefix_cache))
+            ordinary_prefix_cache=objects.cache.enable_prefix_cache, model_identity=self.model_identity))
 
     async def native_tokenize(self, request: HTTPRequest):
         authorize(request.headers)
@@ -141,7 +143,8 @@ class NativeServer(ServingServer):
         self._budget(tokens, config)
         return JSONResponse(dict(model=self.model_id, layout=objects.node.contract.layout,
             prompt_token_ids=tokens, generation=asdict(config), parser=asdict(parser) if parser else None,
-            constraint=constraint.to_wire() if constraint else None, parallel_tool_calls=public.parallel_tool_calls))
+            constraint=constraint.to_wire() if constraint else None, parallel_tool_calls=public.parallel_tool_calls,
+            model_identity=self.model_identity))
 
     def _budget(self, tokens, config):
         if len(tokens) + config.max_new_tokens > self.engine.config.resolve_runtime_config().max_seq_len:
@@ -158,6 +161,8 @@ class NativeServer(ServingServer):
         authorize(request.headers)
         objects = self._objects()
         raw = await request.json()
+        if raw.get("model_identity") != self.model_identity:
+            raise RouterError(409, "model_identity_mismatch", "Native generation checkpoint identity differs")
         if raw.get("model") != self.model_id or raw.get("layout") != objects.node.contract.layout:
             raise ValueError("Native generation model/layout mismatch")
         scope = owner(raw)

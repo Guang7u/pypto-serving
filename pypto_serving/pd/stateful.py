@@ -60,11 +60,12 @@ class NativeObjects:
     unbounded table of released objects or reuse of bare block IDs as identity.
     """
 
-    def __init__(self, cache, node, pins):
+    def __init__(self, cache, node, pins, model_identity=None):
         if (node.contract.adapter != "qwen3-14b-paged" or cache.group_names != ("kv",)
                 or cache.group_specs[0].spec.token_capacity != 128):
             raise ValueError("Stateful retention requires the Qwen3-14B paged layout")
         self.cache, self.node, self.pins = cache, node, pins
+        self.model_identity = model_identity
         self.secret = secrets.token_bytes(32)
         self.objects: dict[str, _Object] = {}
         self.requests: dict[str, str] = {}
@@ -86,6 +87,8 @@ class NativeObjects:
                        request_id=entry.binding.request, partition=chunk.partition,
                        durability="volatile", retained_tokens=boundary, confirmed_tokens=chunk.end,
                        block_size=128, prefix_digest=digest(list(entry.continuation.tokens[:boundary])))
+        if self.model_identity is not None:
+            receipt["model_identity_digest"] = self.model_identity
         if getattr(entry, "native_parent", None) is not None:
             receipt.update(mounted_tokens=entry.mounted_tokens, mounted_object_id=entry.native_parent["object_id"])
         self.cache.retain_group_block_snapshot(tables, chunk.partition)
@@ -109,6 +112,8 @@ class NativeObjects:
             raise ValueError("native must be an object receipt")
         expected = dict(node_id=self.node.node_id, boot=self.node.boot, registry=self.node.registry,
                         model=self.node.contract.model, layout=self.node.contract.layout)
+        if self.model_identity is not None:
+            expected["model_identity_digest"] = self.model_identity
         if any(receipt.get(key) != value for key, value in expected.items()):
             raise RouterError(409, "native_identity_mismatch", "Native object belongs to a different node identity")
         unsigned = dict(receipt)

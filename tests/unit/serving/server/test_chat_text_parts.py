@@ -44,3 +44,13 @@ def test_non_text_or_malformed_parts_are_rejected(content):
 def test_existing_content_values_are_preserved(content):
     request = ChatCompletionRequest.model_validate({"messages": [{"role": "assistant", "content": content}]})
     assert request.messages[0].content == content
+
+
+@pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
+def test_restored_reasoning_alias_is_preserved_for_the_actual_template(field):
+    request = ChatCompletionRequest.model_validate({"messages": [
+        {"role": "assistant", "content": "READY", field: "Saved explanation"},
+        {"role": "user", "content": "Continue"},
+    ]})
+    assert request.messages[0].reasoning == "Saved explanation"
+    assert request.messages[0].model_dump()["reasoning"] == "Saved explanation"
