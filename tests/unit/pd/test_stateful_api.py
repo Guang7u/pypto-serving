@@ -10,12 +10,81 @@
 """Internal Stateful requests use the engine operation and identity seams."""
 
 import asyncio
+import json
 
 import httpx
 import pytest
 
 from pypto_serving.router.app import ServingRouter
 from tests.unit.pd.test_coordination import config
+
+
+def test_native_stream_forwards_delta_before_save_ack_and_guards_terminal(monkeypatch):
+    from starlette.requests import Request
+    from tests.unit.pd.test_coordination import Peers, assert_idle
+    from pypto_serving.pd.stateful import digest, owner
+
+    monkeypatch.setenv("PYPTO_STATEFUL_INTERNAL_TOKEN", "native-stream-test-credential")
+
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        held = asyncio.Event()
+        original = peers.handle
+        payload = dict(model="model", tenant_id="tenant", cache_salt="salt", version_id="version",
+                       prompt_token_ids=list(range(147)), stream=True)
+
+        async def handle(req):
+            if not req.url.path.endswith("/generate"):
+                return await original(req)
+            context = json.loads(req.headers["x-pd-context"])
+            binding = context["binding"]
+            node = peers.nodes[req.url.host]
+            if node.role == "prefill":
+                await held.wait()
+                receipt = dict(owner(payload), node_id=node.node_id, boot=node.boot, registry=node.registry,
+                    model=node.contract.model, layout=node.contract.layout, request_id=binding["request"],
+                    durability="volatile", retained_tokens=128, confirmed_tokens=147, block_size=128,
+                    prefix_digest=digest(payload["prompt_token_ids"][:128]), object_id="external-owner-receipt")
+                return httpx.Response(200, json=dict(request=binding["request"], status="ready", native=receipt))
+            delta = dict(request=binding["request"], delta="answer")
+            terminal = dict(request=binding["request"], prompt_token_ids=payload["prompt_token_ids"],
+                            token_ids=[42], text="answer", finish_reason="stop")
+            return httpx.Response(200, text="".join(
+                "data: " + json.dumps(value) + "\n\n" for value in (delta, terminal)) + "data: [DONE]\n\n",
+                headers={"Content-Type": "text/event-stream"})
+
+        router = ServingRouter(cfg, client_factory=lambda _: httpx.AsyncClient(
+            transport=httpx.MockTransport(handle), timeout=1))
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": json.dumps(payload).encode()}
+            await asyncio.Future()
+            return {"type": "http.disconnect"}
+
+        incoming = Request({"type": "http", "method": "POST", "path": "/internal/stateful/v1/generate",
+                            "headers": [(b"authorization", b"Bearer native-stream-test-credential")]}, receive)
+        async with router.app.router.lifespan_context(router.app):
+            response = await router.proxy.forward(incoming, "/internal/stateful/v1/generate")
+            assert response.status_code == 200, response.body
+            first = await anext(response.body_iterator)
+            assert json.loads(first.removeprefix("data: "))["delta"] == "answer"
+            pending = asyncio.create_task(anext(response.body_iterator))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not pending.done()
+            held.set()
+            terminal = json.loads((await pending).removeprefix("data: "))
+            assert terminal["native"]["object_id"] == "external-owner-receipt"
+            assert terminal["token_ids"] == [42]
+            assert "".join([chunk async for chunk in response.body_iterator]) == "data: [DONE]\n\n"
+            assert_idle(router)
+
+    asyncio.run(run())
 
 
 def test_internal_generation_requires_an_internal_credential(monkeypatch):

@@ -145,9 +145,9 @@ class PDCoordinator:
                 raise ValueError("request must be a JSON object")
             payload["stream"] = _STREAM.validate_python(payload.get("stream", False))
             if path.startswith(INTERNAL_PREFIX):
-                if payload["stream"]:
-                    raise ValueError("Native requests currently require stream=false")
                 if path != INTERNAL_PREFIX + "generate":
+                    if payload["stream"] and path != INTERNAL_PREFIX + "tokenize":
+                        raise ValueError("Native ownership operations require stream=false")
                     return await self._native_owner_request(request, path, payload, session_id)
                 return await self._native_forward(request, path, owner, payload, session_id)
             return await self._forward(request, path, owner, payload, session_id)
@@ -287,6 +287,14 @@ class PDCoordinator:
             if not valid:
                 raise RouterError(503, "pd_protocol_error", "Prefill returned an invalid handoff confirmation")
 
+        def native_result(value):
+            if (not isinstance(value, dict) or value.get("request") != binding.request
+                    or value.get("prompt_token_ids") != payload["prompt_token_ids"]
+                    or not isinstance(value.get("token_ids"), list) or not value["token_ids"]
+                    or any(type(token) is not int or token < 0 for token in value["token_ids"])):
+                raise ValueError("D returned an invalid native token result")
+            return dict(value, native=native_confirmation)
+
         try:
             def headers(peer):
                 return request_headers(request.headers, drop=("content-encoding", "content-type", "x-pd-context"),
@@ -320,14 +328,7 @@ class PDCoordinator:
                 body = await response.aread()
                 await ready()
                 if native:
-                    value = json.loads(body)
-                    if (not isinstance(value, dict) or value.get("request") != binding.request
-                            or value.get("prompt_token_ids") != payload["prompt_token_ids"]
-                            or not isinstance(value.get("token_ids"), list) or not value["token_ids"]
-                            or any(type(token) is not int or token < 0 for token in value["token_ids"])):
-                        raise ValueError("D returned an invalid native token result")
-                    value["native"] = native_confirmation
-                    body = json.dumps(value).encode()
+                    body = json.dumps(native_result(json.loads(body))).encode()
                 finished = True
                 result = Response(body, headers=response_headers(response, session_id, decoded=True))
                 await retirement.wait()
@@ -338,6 +339,7 @@ class PDCoordinator:
                 frame = []
                 size = 0
                 upstream_failed = False
+                native_result_seen = False
                 try:
                     retirement.begin()
                     async for line in response.aiter_lines():
@@ -357,6 +359,18 @@ class PDCoordinator:
                                 raise ValueError("Decode SSE data must be a JSON object")
                             if value and value.get("error") is not None:
                                 upstream_failed = True
+                            if native and not upstream_failed:
+                                if terminal:
+                                    if not native_result_seen:
+                                        raise ValueError("D stream ended without native token result")
+                                elif native_result_seen or value.get("request") != binding.request:
+                                    raise ValueError("D returned an invalid native stream sequence")
+                                elif value.get("finish_reason") is not None:
+                                    await ready()
+                                    text = "data: " + json.dumps(native_result(value))
+                                    native_result_seen = True
+                                elif not isinstance(value.get("delta"), str):
+                                    raise ValueError("D returned an invalid native stream delta")
                             if not upstream_failed and (terminal or (
                                     value and any(c.get("finish_reason") for c in value.get("choices", [])))):
                                 await ready()

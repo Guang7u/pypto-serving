@@ -118,7 +118,7 @@ class Server(ServingServer):
             node_id=node.node_id, boot=node.boot, registry=node.registry, block_size=128, durability="volatile",
             max_model_len=self.real_engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
-            native_mount=True, streaming=False, tools=False, durable=False,
+            native_mount=True, streaming=True, tools=False, durable=False,
             ordinary_prefix_cache=self.service.cache.enable_prefix_cache))
 
     async def native_cancel(self, request: HTTPRequest):
@@ -144,8 +144,6 @@ class Server(ServingServer):
             raise ValueError("model differs from the P owner")
         prompt, config, parser, constraint = await self.prepare_chat(public)
         self.service.adapter.validate(config)
-        if config.stream:
-            raise ValueError("Native generation currently requires stream=false")
         return JSONResponse(dict(model=self.service.node.contract.model, layout=self.service.node.contract.layout,
             prompt_token_ids=list(self.real_engine._tokenize_prompt(prompt)), generation=asdict(config),
             parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None))
@@ -188,8 +186,10 @@ class Server(ServingServer):
         except TypeError as exc:
             raise ValueError("invalid native generation configuration") from exc
         self.service.adapter.validate(config)
-        if config.stream or len(tokens) + config.max_new_tokens > self.real_engine.config.resolve_runtime_config().max_seq_len:
-            raise ValueError("Native generation requires stream=false and a bounded context/output budget")
+        if type(raw.get("stream", False)) is not bool or raw.get("stream", False) != config.stream:
+            raise ValueError("Native stream flag differs from generation configuration")
+        if len(tokens) + config.max_new_tokens > self.real_engine.config.resolve_runtime_config().max_seq_len:
+            raise ValueError("Native generation requires a bounded context/output budget")
         if constraint is not None:
             await self._preflight_constraint(constraint)
         if self.service.role == "prefill":
@@ -283,6 +283,33 @@ class Server(ServingServer):
             continuation = entry.continuation
             config = GenerateConfig(**continuation.config)
             if native is not None:
+                def result(output):
+                    return dict(request=binding.request, prompt_token_ids=list(continuation.tokens),
+                                token_ids=list(output.token_ids), text=output.text, finish_reason=output.finish_reason)
+
+                if config.stream:
+                    async def native_stream():
+                        successful = False
+                        try:
+                            async with aclosing(self.service.outputs(binding.request)) as outputs:
+                                async for output in outputs:
+                                    if output.text_delta:
+                                        yield "data: " + json.dumps(
+                                            dict(request=binding.request, delta=output.text_delta)) + "\n\n"
+                                    if output.finished:
+                                        if output.finish_reason == "error":
+                                            raise RuntimeError("D did not produce a successful native result")
+                                        yield "data: " + json.dumps(result(output)) + "\n\n"
+                                        successful = True
+                                        yield "data: [DONE]\n\n"
+                                        return
+                            raise RuntimeError("D stream ended without a native result")
+                        finally:
+                            if not successful:
+                                entry.response_closed = True
+                                await self.service.abort(entry)
+
+                    return StreamingResponse(self.stream(native_stream()), media_type="text/event-stream")
                 final = None
                 async with aclosing(self.service.outputs(binding.request)) as outputs:
                     async for output in outputs:
@@ -290,8 +317,7 @@ class Server(ServingServer):
                             final = output
                 if final is None or final.finish_reason == "error":
                     raise RuntimeError("D did not produce a successful native result")
-                return JSONResponse(dict(request=binding.request, prompt_token_ids=list(continuation.tokens),
-                    token_ids=list(final.token_ids), text=final.text, finish_reason=final.finish_reason))
+                return JSONResponse(result(final))
             if kind == "chat":
                 response = await self.chat_response(binding.request, public, "", config,
                     OutputParserSpec(**continuation.parser) if continuation.parser else None, None)
