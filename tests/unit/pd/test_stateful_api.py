@@ -298,6 +298,10 @@ def test_computed_output_pages_replace_the_private_pin_and_mount_only_the_real_p
     mounted = objects.mount(receipt2, entry.native_scope, child, mount_tokens=128)
     assert mounted.token_count == 128
     assert len(mounted.block_ids["kv"]) == 1
+    # Existing sampling requires a prompt suffix even for an exactly matching
+    # block-aligned input. This is an explicit engine boundary, not a lost KV.
+    exact = objects.mount(receipt2, entry.native_scope, list(actual), mount_tokens=128)
+    assert exact.token_count == 128
     with pytest.raises(RouterError, match="prefix"):
         objects.mount(receipt2, entry.native_scope, child, mount_tokens=256)
     with pytest.raises(RouterError):
