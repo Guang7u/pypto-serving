@@ -146,8 +146,11 @@ class Server(ServingServer):
             raise ValueError("model differs from the P owner")
         prompt, config, parser, constraint = await self.prepare_chat(public)
         self.service.adapter.validate(config)
+        tokens = list(self.real_engine._tokenize_prompt(prompt))
+        if len(tokens) + config.max_new_tokens > self.real_engine.config.resolve_runtime_config().max_seq_len:
+            raise RouterError(400, "context_length_exceeded", "Input tokens plus output budget exceed model context")
         return JSONResponse(dict(model=self.service.node.contract.model, layout=self.service.node.contract.layout,
-            prompt_token_ids=list(self.real_engine._tokenize_prompt(prompt)), generation=asdict(config),
+            prompt_token_ids=tokens, generation=asdict(config),
             parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None,
             parallel_tool_calls=public.parallel_tool_calls))
 
