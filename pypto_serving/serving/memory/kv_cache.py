@@ -1057,7 +1057,7 @@ class KvCacheManager:
         if not 0 <= partition < self.group_partition_count or prefix.token_count < 0:
             raise ValueError("Invalid confirmed prefix partition or token count")
         tables = {name: list(ids) for name, ids in prefix.block_ids.items()}
-        selected = {}
+        selected: dict[str, list[KVCacheBlock | None]] = {}
         for name, pool in self._group_pools.items():
             size = pool.spec.spec.token_capacity
             ids = tables[name]
