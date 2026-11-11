@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import dataclasses
 import importlib.util
+import hashlib
 import json
 import logging
 import time
@@ -667,13 +668,26 @@ class ServingServer:
         hf_messages = [m.model_dump(exclude_none=True) for m in messages]
         for original, message in zip(messages, hf_messages):
             message["content"] = original.content
+        kwargs = self._effective_chat_kwargs(chat_template_kwargs, reasoning_effort, tools)
+        return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
+
+    @classmethod
+    def _effective_chat_kwargs(cls, chat_template_kwargs, reasoning_effort, tools):
         kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
-        kwargs.update(self._chat_kwargs(chat_template_kwargs, reasoning_effort))
+        kwargs.update(cls._chat_kwargs(chat_template_kwargs, reasoning_effort))
         if tools:
             kwargs["tools"] = [tool.model_dump(exclude_none=True) for tool in tools]
         kwargs["tokenize"] = False
         kwargs["add_generation_prompt"] = True
-        return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
+        return kwargs
+
+    def rendering_profile(self, request: ChatCompletionRequest) -> dict:
+        """Identify the selected template and the exact arguments used to render it."""
+        kwargs = self._effective_chat_kwargs(request.chat_template_kwargs, request.reasoning_effort, request.tools)
+        template = self.engine.tokenizer.tokenizer.get_chat_template(
+            chat_template=kwargs.get("chat_template"), tools=kwargs.get("tools"))
+        encoded = json.dumps(template, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        return dict(template_digest=hashlib.sha256(encoded).hexdigest(), kwargs=kwargs)
 
     @staticmethod
     def _chat_kwargs(chat_template_kwargs: dict | None, reasoning_effort: str | None) -> dict:

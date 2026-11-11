@@ -144,7 +144,7 @@ class NativeServer(ServingServer):
         return JSONResponse(dict(model=self.model_id, layout=objects.node.contract.layout,
             prompt_token_ids=tokens, generation=asdict(config), parser=asdict(parser) if parser else None,
             constraint=constraint.to_wire() if constraint else None, parallel_tool_calls=public.parallel_tool_calls,
-            model_identity=self.model_identity))
+            model_identity=self.model_identity, rendering=self.rendering_profile(public)))
 
     def _budget(self, tokens, config):
         if len(tokens) + config.max_new_tokens > self.engine.config.resolve_runtime_config().max_seq_len:

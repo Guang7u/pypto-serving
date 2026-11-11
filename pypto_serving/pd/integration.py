@@ -157,7 +157,8 @@ class Server(ServingServer):
         return JSONResponse(dict(model=self.service.node.contract.model, layout=self.service.node.contract.layout,
             prompt_token_ids=tokens, generation=asdict(config),
             parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None,
-            parallel_tool_calls=public.parallel_tool_calls, model_identity=self.model_identity))
+            parallel_tool_calls=public.parallel_tool_calls, model_identity=self.model_identity,
+            rendering=self.rendering_profile(public)))
 
     async def native_generate(self, request: HTTPRequest):
         authorize(request.headers)
