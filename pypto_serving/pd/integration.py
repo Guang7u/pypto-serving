@@ -118,7 +118,8 @@ class Server(ServingServer):
             node_id=node.node_id, boot=node.boot, registry=node.registry, block_size=128, durability="volatile",
             max_model_len=self.real_engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
-            native_mount=False, streaming=False, tools=False, durable=False))
+            native_mount=True, streaming=False, tools=False, durable=False,
+            ordinary_prefix_cache=self.service.cache.enable_prefix_cache))
 
     async def native_cancel(self, request: HTTPRequest):
         authorize(request.headers)
@@ -169,8 +170,8 @@ class Server(ServingServer):
         node = self.service.node
         if raw.get("model") != node.contract.model or raw.get("layout") != node.contract.layout:
             raise ValueError("Native generation model/layout mismatch")
-        if raw.get("parent") is not None:
-            raise ValueError("Native parent mounting is not implemented")
+        if raw.get("parent") is not None and not isinstance(raw["parent"], dict):
+            raise ValueError("Native parent must be an object receipt")
         scope = owner(raw)
         tokens = raw.get("prompt_token_ids")
         if not isinstance(tokens, list) or not tokens or any(type(t) is not int or t < 0 for t in tokens):
@@ -239,6 +240,7 @@ class Server(ServingServer):
             try:
                 if native is not None:
                     continuation, entry.native_scope = native
+                    entry.native_parent = raw.get("parent")
                 else:
                     if kind == "chat":
                         prompt, config, parser, constraint = await self.prepare_chat(public)

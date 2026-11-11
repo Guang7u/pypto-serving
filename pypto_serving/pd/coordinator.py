@@ -90,12 +90,21 @@ class PDCoordinator:
     def pairs(self, model=None):
         return [pair for pair in self._candidates(model) if pair is not None]
 
-    def _admit(self, payload):
+    def _admit(self, payload, *, parent=None):
         """Select current immutable node snapshots and reserve counts without yielding."""
         model = payload.get("model")
         if model is not None and not isinstance(model, str):
             raise ValueError("model must be a string")
         candidates = self._candidates(model or None)
+        if parent is not None:
+            if not isinstance(parent, dict):
+                raise ValueError("Native parent must be an object receipt")
+            node = self.nodes.get(parent.get("node_id"))
+            if (node is None or node.role != "prefill" or not self.registry.state(node.node_id).routable
+                    or parent.get("boot") != node.boot or parent.get("registry") != node.registry
+                    or parent.get("model") != node.contract.model or parent.get("layout") != node.contract.layout):
+                raise RouterError(409, "session_kv_lost", "The parent P identity is unavailable")
+            candidates = [pair if pair and pair[0].key == node.key else None for pair in candidates]
         if not any(candidates):
             if model and model not in self.models and len(self.discovered) == len(self.registry.states):
                 raise RouterError(404, "model_not_found", f"Unknown model: {model}")
@@ -219,10 +228,11 @@ class PDCoordinator:
             await retirement.wait()
 
     async def _forward(self, request, path, owner, payload, session_id):
-        p, d, binding, endpoints, release = self._admit(payload)
+        native = path == INTERNAL_PREFIX + "generate"
+        parent = payload.get("parent") if native else None
+        p, d, binding, endpoints, release = self._admit(payload, parent=parent)
         p_task = d_task = response = None
         finished = False
-        native = path == INTERNAL_PREFIX + "generate"
         native_confirmation = None
         async def before_close():
             if not finished:
@@ -255,12 +265,17 @@ class PDCoordinator:
             try:
                 value = result.json()
                 if native:
+                    if not isinstance(value, dict):
+                        raise ValueError("Native confirmation must be an object")
                     native_confirmation = value.get("native")
                     expected = dict(native_owner(payload), node_id=p.node_id, boot=p.boot, registry=p.registry,
                                     model=p.contract.model, layout=p.contract.layout, request_id=binding.request,
                                     durability="volatile", retained_tokens=len(payload["prompt_token_ids"]) // 128 * 128,
                                     confirmed_tokens=len(payload["prompt_token_ids"]), block_size=128,
                                     prefix_digest=digest(payload["prompt_token_ids"][:len(payload["prompt_token_ids"]) // 128 * 128]))
+                    if parent is not None:
+                        expected.update(mounted_object_id=parent.get("object_id"),
+                                        mounted_tokens=parent.get("retained_tokens"))
                     valid = (value.get("request") == binding.request and value.get("status") == "ready"
                              and isinstance(native_confirmation, dict)
                              and all(native_confirmation.get(k) == v for k, v in expected.items())

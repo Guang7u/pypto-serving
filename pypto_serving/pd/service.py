@@ -59,6 +59,8 @@ class Request:
     worker_release_ack: asyncio.Event = field(default_factory=asyncio.Event)
     completion_source: str | None = None
     native_scope: dict | None = None
+    native_parent: dict | None = None
+    mounted_tokens: int | None = None
     native: dict | None = None
 
 
@@ -538,9 +540,14 @@ class Service:
         self.adapter.validate(config)
         queue = self.chunks[request] = asyncio.Queue(maxsize=2)
         async def consume():
+            resume = {}
+            if entry.native_parent is not None:
+                prefix = self.native_objects.mount(entry.native_parent, entry.native_scope, continuation.tokens)
+                entry.mounted_tokens = prefix.token_count
+                resume["confirmed_prefix"] = prefix
             async for _ in self.core.add_request(request, "", config, prompt_token_ids=continuation.tokens,
                                                   constraint_spec=(ConstraintSpec.from_wire(continuation.constraint)
-                                                                   if continuation.constraint else None)):
+                                                                   if continuation.constraint else None), **resume):
                 pass
         drain = None
         inflight = None
@@ -567,6 +574,8 @@ class Service:
                     chunk = chunk_task.result()
                     if p_hit is None:
                         p_hit = chunk.start
+                        if entry.mounted_tokens is not None and p_hit != entry.mounted_tokens:
+                            raise RuntimeError("Actual prefill start differs from the mounted prefix")
                         entry.p_hit = p_hit
                     if inflight is not None:
                         await inflight
@@ -638,7 +647,9 @@ class Service:
                         self.pins.release(request)
                     await self.core.abort_request(request)
                     if drain is not None:
-                        await drain
+                        # The drain may have supplied the failure already being handled.
+                        # Retire it before sending the sender-stop confirmation.
+                        await asyncio.gather(drain, return_exceptions=True)
                 try:
                     await call("abort", stopped=not uncertain)
                 except Exception:

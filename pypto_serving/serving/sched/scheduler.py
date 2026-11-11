@@ -18,7 +18,7 @@ from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.kv_cache import ConfirmedGroupPrefix, KVCacheCapacityError, KvCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,12 @@ class Request:
     prefill_complete: bool = False
     scheduling_held: bool = False
     cache_reservation_id: str = ""
+    confirmed_prefix: ConfirmedGroupPrefix | None = None
     requires_initial_step: bool = False
+
+    @property
+    def can_recompute(self) -> bool:
+        return self.constraint_spec is None and not self.cache_reservation_id and self.confirmed_prefix is None
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -276,6 +281,11 @@ class Scheduler:
                 f"Request {request.request_id} min_tokens {request.min_tokens} exceeds "
                 f"available generation tokens {request.max_new_tokens}"
             )
+        if request.confirmed_prefix is not None:
+            if not 0 <= request.confirmed_prefix.token_count < prompt_len:
+                raise ValueError("Confirmed prefix must leave a prompt suffix for Prefill")
+            request.num_computed_tokens = request.confirmed_prefix.token_count
+            request.prefix_cache_metrics_recorded = True
         if not self.config.enable_prefix_cache:
             rejection = self._single_prefill_rejection(request)
             if rejection is not None:
@@ -293,6 +303,12 @@ class Scheduler:
                 request.block_hashes = self.kv_cache_manager.compute_block_hashes(
                     request.prompt_token_ids
                 )
+        if request.confirmed_prefix is not None:
+            request.allocated_group_block_ids = self.kv_cache_manager.attach_confirmed_group_prefix(
+                request.request_id, request.confirmed_prefix,
+            )
+            if request.allocated_group_block_ids:
+                request.cache_partition = request.confirmed_prefix.partition
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
         self.requests[request.request_id] = request
@@ -481,7 +497,7 @@ class Scheduler:
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
                 if preempted is None:
-                    if request.constraint_spec is not None or request.cache_reservation_id:
+                    if not request.can_recompute:
                         stalled_non_recomputable.append(request)
                     running_to_keep.append(request)
                     continue
@@ -536,8 +552,12 @@ class Scheduler:
             # Neither a constrained matcher nor an external Prefill can be
             # reconstructed by local recompute. Reject rather than spin forever.
             victim = stalled_non_recomputable[-1]
-            reason = ("external Prefill cannot be recomputed locally" if victim.cache_reservation_id
-                      else "constrained recompute preemption is not supported")
+            if victim.confirmed_prefix is not None:
+                reason = "confirmed prefix cannot be recomputed"
+            elif victim.cache_reservation_id:
+                reason = "external Prefill cannot be recomputed locally"
+            else:
+                reason = "constrained recompute preemption is not supported"
             self.abort_request(victim.request_id)
             output.rejected_requests[victim.request_id] = (
                 f"Request {victim.request_id} cannot allocate KV blocks; {reason}"
@@ -566,8 +586,8 @@ class Scheduler:
                 remaining_waiting.append(request)
                 continue
 
-            # Prefix cache lookup
-            if self.config.enable_prefix_cache:
+            # A confirmed native prefix already owns its pages; skip ordinary lookup.
+            if self.config.enable_prefix_cache and request.confirmed_prefix is None:
                 if self.kv_cache_manager.has_groups:
                     (
                         request.allocated_group_block_ids,
@@ -628,11 +648,18 @@ class Scheduler:
                     request.num_computed_tokens = max(0, request.num_prompt_tokens - 1)
                     num_new = 1
                 else:
-                    self._release_waiting_prefix_blocks(request)
+                    if request.confirmed_prefix is None:
+                        self._release_waiting_prefix_blocks(request)
                     remaining_waiting.append(request)
                     continue
 
             allocated = self._try_allocate_request_blocks(request, num_new)
+            if not allocated and request.confirmed_prefix is not None:
+                self._release_waiting_prefix_blocks(request)
+                request.status = RequestStatus.FINISHED_ABORTED
+                self.requests.pop(request.request_id, None)
+                output.rejected_requests[request.request_id] = "Cannot allocate suffix for confirmed prefix"
+                continue
             if not allocated and grouped_prefix_hit:
                 # A grouped hit is rank-local. If its partition cannot hold the
                 # uncached suffix, release the hit and retry cold so an idle
@@ -1174,8 +1201,7 @@ class Scheduler:
         candidates = [
             r
             for r in self.running
-            if r.request_id != exclude.request_id and r.constraint_spec is None
-            and not r.cache_reservation_id
+            if r.request_id != exclude.request_id and r.can_recompute
             and not r.prefill_complete and not r.scheduling_held
         ]
         if self.kv_cache_manager.has_groups:

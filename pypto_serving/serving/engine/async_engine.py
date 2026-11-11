@@ -25,7 +25,7 @@ from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.memory.kv_cache import ConfirmedGroupPrefix, KvCacheManager
 from pypto_serving.serving.reasoning import (
     OutputParserSpec, ParsedToolCall, ToolCallDelta, create_output_parser,
 )
@@ -559,6 +559,7 @@ class ReplicaEngineCore:
         prompt_token_ids: Sequence[int] | None = None,
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
+        confirmed_prefix: ConfirmedGroupPrefix | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
         with profile_span(
@@ -580,6 +581,7 @@ class ReplicaEngineCore:
                 top_k=config.top_k,
                 seed=config.seed,
                 constraint_spec=constraint_spec,
+                confirmed_prefix=confirmed_prefix,
             )
 
             if request_id in self._request_contexts:

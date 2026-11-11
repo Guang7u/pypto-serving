@@ -86,6 +86,8 @@ class NativeObjects:
                        request_id=entry.binding.request, partition=chunk.partition,
                        durability="volatile", retained_tokens=boundary, confirmed_tokens=chunk.end,
                        block_size=128, prefix_digest=digest(list(entry.continuation.tokens[:boundary])))
+        if getattr(entry, "native_parent", None) is not None:
+            receipt.update(mounted_tokens=entry.mounted_tokens, mounted_object_id=entry.native_parent["object_id"])
         self.cache.retain_group_block_snapshot(tables, chunk.partition)
         key = None
         try:
@@ -136,6 +138,22 @@ class NativeObjects:
             del self.objects[key]
             self.requests.pop(record.receipt["request_id"], None)
         return self.status(receipt)
+
+    def mount(self, receipt, scope, tokens):
+        from pypto_serving.serving.memory.kv_cache import ConfirmedGroupPrefix
+
+        key = self._check(receipt)
+        record = self.objects.get(key)
+        if record is None:
+            raise RouterError(409, "session_kv_lost", "The parent native object is no longer live")
+        if any(receipt.get(field) != scope[field] for field in ("tenant_id", "cache_salt_digest")):
+            raise RouterError(403, "native_owner_mismatch", "The parent native object has a different owner")
+        boundary = receipt["retained_tokens"]
+        if boundary >= len(tokens) or digest(list(tokens[:boundary])) != receipt["prefix_digest"]:
+            raise RouterError(409, "native_prefix_mismatch", "Prompt differs from the confirmed parent prefix")
+        return ConfirmedGroupPrefix(
+            boundary, record.partition, {name: tuple(ids) for name, ids in record.blocks.items()},
+        )
 
     def validate_binding(self, binding):
         key = self.requests.get(binding.request)

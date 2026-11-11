@@ -28,6 +28,15 @@ class KVCacheCapacityError(RuntimeError):
     """Raised when a cache allocation cannot fit in the physical pools."""
 
 
+@dataclass(frozen=True)
+class ConfirmedGroupPrefix:
+    """Complete, already-owned pages in one allocation partition."""
+
+    token_count: int
+    partition: int
+    block_ids: dict[str, tuple[int, ...]]
+
+
 def hash_block_tokens(parent_hash: bytes, token_ids: tuple[int, ...]) -> bytes:
     """Return a stable chained digest suitable for cross-process identity."""
     digest = hashlib.sha256()
@@ -1035,6 +1044,40 @@ class KvCacheManager:
             self._protect_group_checkpoint(request_id, block_hashes, num_computed_tokens, partition,
                                            valid_from, checkpoint_boundary)
         return cached_counts
+
+    def attach_confirmed_group_prefix(
+        self, request_id: str, prefix: ConfirmedGroupPrefix,
+    ) -> dict[str, list[int]]:
+        """Give a request its own references to a verified physical prefix."""
+        if request_id in self._group_request_partitions:
+            raise ValueError("Request already owns grouped KV blocks")
+        if not self._group_pools or set(prefix.block_ids) != set(self._group_pools):
+            raise ValueError("Confirmed prefix does not match configured cache groups")
+        partition = prefix.partition
+        if not 0 <= partition < self.group_partition_count or prefix.token_count < 0:
+            raise ValueError("Invalid confirmed prefix partition or token count")
+        tables = {name: list(ids) for name, ids in prefix.block_ids.items()}
+        selected = {}
+        for name, pool in self._group_pools.items():
+            size = pool.spec.spec.token_capacity
+            ids = tables[name]
+            if (pool.spec.sliding_window is not None or pool.spec.is_eagle_group
+                    or prefix.token_count != len(ids) * size or len(ids) > pool.spec.max_blocks_per_seq):
+                raise ValueError("Confirmed prefix must contain complete non-rolling pages")
+            selected[name] = [pool.block_from_local_id(partition, index) for index in ids]
+        if not prefix.token_count:
+            return {}
+        request_limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
+        if (request_limit is not None
+                and sum(owner == partition for owner in self._group_request_partitions.values()) >= request_limit):
+            raise KVCacheCapacityError("Confirmed prefix partition has no request slot")
+        self.retain_group_block_snapshot(tables, partition)
+        self._group_request_partitions[request_id] = partition
+        for name, pool in self._group_pools.items():
+            pool.request_blocks[request_id] = selected[name]
+            pool.request_partitions[request_id] = partition
+            pool.request_logical_blocks[request_id] = len(selected[name])
+        return tables
 
     def retain_group_block_snapshot(
         self,

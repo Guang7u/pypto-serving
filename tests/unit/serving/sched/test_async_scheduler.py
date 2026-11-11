@@ -1096,3 +1096,48 @@ def test_grouped_prefix_metrics_count_reused_tokens():
     assert output.prefix_cache_queries == 4
     assert output.prefix_cache_hits == 4
     assert output.prefix_cache_query_tokens == 5
+
+
+def test_confirmed_prefix_survives_single_dispatch_budget_deferral():
+    from pypto_serving.serving.memory.kv_cache import ConfirmedGroupPrefix
+
+    cache = KvCacheManager(enable_prefix_cache=False)
+    cache.init_groups((KVCacheGroupSpec("kv", (0,), KVCacheSpec(128, 128), 16, num_blocks=16),),
+                      max_batch_size=2)
+    parent = cache.ensure_group_blocks("parent", 128, partition=0)
+    prefix = ConfirmedGroupPrefix(128, 0, {"kv": tuple(parent["kv"])})
+    scheduler = Scheduler(SchedulerConfig(
+        enable_prefix_cache=False, enable_chunk_prefill=False, max_num_scheduled_tokens=64,
+    ), cache)
+    scheduler.add_request(Request("first", list(range(32)), 1))
+    scheduler.add_request(Request("child", list(range(170)), 1, confirmed_prefix=prefix))
+    assert [item.request.request_id for item in scheduler.schedule().scheduled_requests] == ["first"]
+    scheduler.abort_request("first")
+    [child] = scheduler.schedule().scheduled_requests
+    assert (child.num_computed_tokens, child.num_new_tokens) == (128, 42)
+    assert child.block_ids_by_group["kv"][0] == parent["kv"][0]
+    scheduler.abort_request("child")
+    cache.release_all_group_requests("parent")
+    assert cache.group_num_free_blocks("kv", 0) == 16
+
+
+def test_confirmed_prefix_suffix_capacity_failure_retires_only_child_references():
+    from pypto_serving.serving.memory.kv_cache import ConfirmedGroupPrefix
+
+    cache = KvCacheManager(enable_prefix_cache=False)
+    cache.init_groups((KVCacheGroupSpec("kv", (0,), KVCacheSpec(128, 128), 2, num_blocks=2),),
+                      max_batch_size=2)
+    parent = cache.ensure_group_blocks("parent", 128, partition=0)
+    cache.ensure_group_blocks("blocker", 128, partition=0)
+    prefix = ConfirmedGroupPrefix(128, 0, {"kv": tuple(parent["kv"])})
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), cache)
+    scheduler.add_request(Request("child", list(range(170)), 1, confirmed_prefix=prefix))
+    output = scheduler.schedule()
+    assert not output.scheduled_requests
+    assert output.rejected_requests == {"child": "Cannot allocate suffix for confirmed prefix"}
+    assert cache.group_request_partition("child") is None
+    assert cache.group_request_partition("parent") == 0
+    assert cache.group_num_free_blocks("kv", 0) == 0
+    cache.release_all_group_requests("parent")
+    cache.release_all_group_requests("blocker")
+    assert cache.group_num_free_blocks("kv", 0) == 2

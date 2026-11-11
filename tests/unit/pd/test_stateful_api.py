@@ -159,3 +159,27 @@ def test_native_capabilities_require_the_internal_credential(monkeypatch):
             assert response.status_code == 401
 
     asyncio.run(run())
+
+
+def test_live_native_mount_attaches_parent_pages_before_scheduling_suffix():
+    from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
+
+    objects, p, d = native_owner()
+    parent, parent_chunk = native_request(objects, p, d)
+    receipt = objects.retain(parent, parent_chunk)
+    objects.cache.release_all_group_requests(parent.binding.request)
+    child_ids = list(parent.continuation.tokens) + list(range(147, 170))
+    child_scope = dict(parent.native_scope, version_id="child")
+    prefix = objects.mount(receipt, child_scope, child_ids)
+
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), objects.cache)
+    scheduler.add_request(Request("child", child_ids, 8, confirmed_prefix=prefix))
+    [scheduled] = scheduler.schedule().scheduled_requests
+    assert scheduled.num_computed_tokens == 128
+    assert scheduled.num_new_tokens == 42
+    assert scheduled.block_ids_by_group["kv"][0] == objects.status(receipt)["pages"]["kv"][0]
+    scheduler.abort_request("child")
+    assert objects.status(receipt)["live"] is True
+    assert objects.status(receipt)["free_blocks"] == 15
+    objects.release(receipt)
+    assert objects.cache.group_num_free_blocks("kv", 0) == 16
