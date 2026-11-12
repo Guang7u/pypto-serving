@@ -209,7 +209,12 @@ class Server(ServingServer):
         if constraint is not None:
             await self._preflight_constraint(constraint)
         if self.service.role == "prefill":
-            self._native_objects()
+            objects = self._native_objects()
+            if raw.get("parent") is not None:
+                # Refuse an already-lost parent before D can acknowledge stream
+                # setup. Actual execution must still acquire its own references
+                # through the mount in Service.prefill; no page IDs escape here.
+                objects.mount(raw["parent"], scope, tokens)
         return Continuation(tuple(tokens), asdict(config), asdict(parser) if parser else None,
                             constraint.to_wire() if constraint else None), scope
 
