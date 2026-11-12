@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import uuid
 
 from fastapi import Request as HTTPRequest
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.pd.protocol import Component, Contract, Continuation, Node, Topology, digest
@@ -144,7 +144,7 @@ class NativeServer(ServingServer):
             node_id=node.node_id, boot=node.boot, registry=node.registry, deployment="single", session_kv_mode=self.session_kv_mode,
             block_size=128, durability="volatile", max_model_len=self.engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
-            native_mount=True, streaming=False, tools=False, durable=False,
+            native_mount=True, streaming=True, tools=False, durable=False,
             ordinary_prefix_cache=objects.cache.enable_prefix_cache, model_identity=self.model_identity))
 
     async def native_tokenize(self, request: HTTPRequest):
@@ -174,8 +174,6 @@ class NativeServer(ServingServer):
     def _validate_generation(config):
         if config.temperature != 0.0 or config.top_p != 1.0 or config.top_k is not None:
             raise ValueError("Native Qwen3 sessions require greedy sampling")
-        if config.stream:
-            raise ValueError("Native single streaming is not yet supported")
 
     async def native_generate(self, request: HTTPRequest):
         authorize(request.headers)
@@ -216,33 +214,86 @@ class NativeServer(ServingServer):
             mounted_tokens=prefix.token_count if prefix else 0, native=None, error=None, done=asyncio.Event())
         self.core.scheduler.native_requests[rid] = entry
         successful = False
-        try:
+        outputs = self.core.add_request(rid, "", config, prompt_token_ids=tokens,
+            output_parser_spec=parser, constraint_spec=constraint, confirmed_prefix=prefix)
+
+        async def cleanup():
+            try:
+                await outputs.aclose()
+            finally:
+                if not successful:
+                    objects.discard_request(rid)
+                self.core.scheduler.native_requests.pop(rid, None)
+                entry.done.set()
+
+        async def frames(first=None):
+            nonlocal successful
             final = None
-            async with aclosing(self.core.add_request(rid, "", config, prompt_token_ids=tokens,
-                    output_parser_spec=parser, constraint_spec=constraint, confirmed_prefix=prefix)) as outputs:
-                async for output in outputs:
+            try:
+                output = first
+                while True:
+                    if output is None:
+                        try:
+                            output = await anext(outputs)
+                        except StopAsyncIteration:
+                            break
+                    if config.stream and (output.text_delta or output.reasoning_delta):
+                        yield dict(request=rid, delta=output.text_delta, reasoning=output.reasoning_delta)
                     if output.finished:
                         final = output
-            if entry.error is not None:
-                raise entry.error
-            if (final is None or final.finish_reason not in {"FINISHED_EOS", "FINISHED_STOP", "FINISHED_LENGTH"}
-                    or entry.native is None):
-                raise RouterError(502, "native_retention_unconfirmed", "Single execution did not confirm a session")
-            status = objects.status(entry.native)
-            if status["request_active"] or status["transfer_references"]:
-                raise RouterError(502, "native_retirement_unconfirmed", "Single request has not retired")
-            calls = final.tool_calls if raw.get("parallel_tool_calls", True) else final.tool_calls[:1]
-            result = dict(request=rid, native=entry.native, prompt_token_ids=tokens, token_ids=list(final.token_ids),
-                text=final.text, finish_reason=final.finish_reason, chat_finish_reason=self._chat_finish_reason(final),
-                reasoning=final.reasoning, tool_calls=[ToolCall(id=call.id, function=FunctionCall(
-                    name=call.name, arguments=call.arguments)).model_dump() for call in calls])
-            successful = True
-            return JSONResponse(result)
-        finally:
-            if not successful:
-                objects.discard_request(rid)
-            self.core.scheduler.native_requests.pop(rid, None)
-            entry.done.set()
+                    output = None
+                if entry.error is not None:
+                    raise entry.error
+                if (final is None or final.finish_reason not in {"FINISHED_EOS", "FINISHED_STOP", "FINISHED_LENGTH"}
+                        or entry.native is None):
+                    raise RouterError(502, "native_retention_unconfirmed", "Single execution did not confirm a session")
+                status = objects.status(entry.native)
+                if status["request_active"] or status["transfer_references"]:
+                    raise RouterError(502, "native_retirement_unconfirmed", "Single request has not retired")
+                calls = final.tool_calls if raw.get("parallel_tool_calls", True) else final.tool_calls[:1]
+                result = dict(request=rid, native=entry.native, prompt_token_ids=tokens, token_ids=list(final.token_ids),
+                    text=final.text, finish_reason=final.finish_reason, chat_finish_reason=self._chat_finish_reason(final),
+                    reasoning=final.reasoning, tool_calls=[ToolCall(id=call.id, function=FunctionCall(
+                        name=call.name, arguments=call.arguments)).model_dump() for call in calls])
+                successful = True
+                yield result
+            finally:
+                await cleanup()
+
+        if config.stream:
+            # Start the existing admission path immediately after the read-only mount.
+            # It acquires the request prefix reference before its first await; no raw
+            # page IDs cross the HTTP-header scheduling boundary without that pin.
+            try:
+                first = await anext(outputs)
+            except BaseException:
+                await cleanup()
+                raise
+
+            async def stream():
+                try:
+                    async with aclosing(frames(first)) as source:
+                        async for frame in source:
+                            yield "data: " + json.dumps(frame) + "\n\n"
+                except Exception as exc:
+                    code = exc.code if isinstance(exc, RouterError) else "native_execution_failed"
+                    yield "data: " + json.dumps(dict(error=dict(code=code, message=str(exc)))) + "\n\n"
+                yield "data: [DONE]\n\n"
+
+            class NativeStreamingResponse(StreamingResponse):
+                async def __call__(self, scope, receive, send):
+                    try:
+                        await super().__call__(scope, receive, send)
+                    finally:
+                        # Header send can fail before the body generator starts.
+                        await cleanup()
+
+            return NativeStreamingResponse(stream(), media_type="text/event-stream")
+        result = None
+        async with aclosing(frames()) as source:
+            async for result in source:
+                pass
+        return JSONResponse(result)
 
     async def native_status(self, request: HTTPRequest):
         authorize(request.headers)
