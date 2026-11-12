@@ -144,7 +144,7 @@ class NativeServer(ServingServer):
             node_id=node.node_id, boot=node.boot, registry=node.registry, deployment="single", session_kv_mode=self.session_kv_mode,
             block_size=128, durability="volatile", max_model_len=self.engine.config.resolve_runtime_config().max_seq_len,
             raw_token_input=True, output_token_ids=True, native_retain=True, native_release=True,
-            native_mount=True, streaming=True, tools=False, durable=False,
+            native_mount=True, streaming=True, tools=True, durable=False,
             ordinary_prefix_cache=objects.cache.enable_prefix_cache, model_identity=self.model_identity))
 
     async def native_tokenize(self, request: HTTPRequest):
@@ -237,8 +237,12 @@ class NativeServer(ServingServer):
                             output = await anext(outputs)
                         except StopAsyncIteration:
                             break
-                    if config.stream and (output.text_delta or output.reasoning_delta):
-                        yield dict(request=rid, delta=output.text_delta, reasoning=output.reasoning_delta)
+                    tool_deltas = [self._tool_delta(item).model_dump(exclude_none=True)
+                                   for item in output.tool_call_deltas
+                                   if raw.get("parallel_tool_calls", True) or item.index == 0]
+                    if config.stream and (output.text_delta or output.reasoning_delta or tool_deltas):
+                        yield dict(request=rid, delta=output.text_delta, reasoning=output.reasoning_delta,
+                                   tool_calls=tool_deltas)
                     if output.finished:
                         final = output
                     output = None
