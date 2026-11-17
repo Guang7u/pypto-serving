@@ -279,3 +279,61 @@ def test_single_stream_close_retires_child_and_preserves_parent(tmp_path, monkey
             worker.released.set()
             assert await engine.stop()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["input", "input-output"])
+@pytest.mark.parametrize("prefix,close_at_flush", [("answer", False), ("", False), ("", True)])
+def test_single_stream_flushes_text_withheld_at_generation_end(
+    tmp_path, monkeypatch, mode, prefix, close_at_flush,
+):
+    """The real detokenizer may withhold a legitimate trailing replacement character."""
+    monkeypatch.setenv("PYPTO_STATEFUL_INTERNAL_TOKEN", "single-stream-credential")
+    checkpoint(tmp_path)
+
+    class TrailingReplacementTokenizer(Tokenizer):
+        def decode(self, ids):
+            return (prefix if 7 in ids else "") + ("\ufffd" if 8 in ids else "")
+
+    async def run():
+        worker = Worker()
+        worker.released.set()
+        runtime = RuntimeConfig(page_size=128, max_batch_size=2, max_seq_len=512,
+            max_num_batched_tokens=512,
+            kv_cache_groups=(KVCacheGroupSpec("kv", (0,), KVCacheSpec(128, 128), 4, num_blocks=16),))
+        config = EngineConfig(model_id="Qwen3-14B", model_dir=str(tmp_path), runtime_config=runtime,
+            max_num_running_reqs=2, max_num_scheduled_tokens=512, enable_prefix_cache=False)
+        tokenizer = TrailingReplacementTokenizer(127 if mode == "input-output" else 147)
+        engine = AsyncLLMEngine(config, tokenizer, core_factory=partial(ReplicaEngineCore,
+            scheduler_factory=partial(SessionScheduler, session_kv_mode=mode), worker_factory=worker.factory))
+        await engine.start()
+        try:
+            server = NativeServer(engine, "Qwen3-14B", GenerateConfig(), session_kv_mode=mode)
+            prepared = await server.native_tokenize(incoming("/tokenize", dict(model="Qwen3-14B",
+                messages=[dict(role="user", content="cpu prompt")], max_completion_tokens=2,
+                stream=True, temperature=0, top_p=1)))
+            response = await server.native_generate(incoming("/generate", dict(json.loads(prepared.body),
+                tenant_id="tenant", cache_salt="salt", version_id="trailing-text", stream=True)))
+            if close_at_flush:
+                first = json.loads((await anext(response.body_iterator)).removeprefix("data: "))
+                assert first["delta"] == "\ufffd" and "native" not in first
+                await response.body_iterator.aclose()
+                async def retired():
+                    while engine.single_core().kv_cache_manager.group_num_free_blocks("kv", 0) != 16:
+                        await asyncio.sleep(.01)
+                await asyncio.wait_for(retired(), 2)
+                return
+            frames = [json.loads(raw.removeprefix("data: ")) async for raw in response.body_iterator
+                      if raw != "data: [DONE]\n\n"]
+            assert not any("error" in frame for frame in frames)
+            [final] = [frame for frame in frames if "native" in frame]
+            assert final["text"] == prefix + "\ufffd"
+            assert "".join(frame.get("delta", "") for frame in frames) == final["text"]
+            assert final["token_ids"] == [7, 8]
+            assert frames[-1] is final
+            await server.native_release(incoming("/objects/release", {"native": final["native"]}))
+            assert engine.single_core().kv_cache_manager.group_num_free_blocks("kv", 0) == 16
+        finally:
+            worker.released.set()
+            assert await engine.stop()
+
+    asyncio.run(run())

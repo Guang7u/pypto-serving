@@ -229,6 +229,8 @@ class NativeServer(ServingServer):
         async def frames(first=None):
             nonlocal successful
             final = None
+            previous_text = ""
+            previous_reasoning = ""
             try:
                 output = first
                 while True:
@@ -240,9 +242,21 @@ class NativeServer(ServingServer):
                     tool_deltas = [self._tool_delta(item).model_dump(exclude_none=True)
                                    for item in output.tool_call_deltas
                                    if raw.get("parallel_tool_calls", True) or item.index == 0]
-                    if config.stream and (output.text_delta or output.reasoning_delta or tool_deltas):
-                        yield dict(request=rid, delta=output.text_delta, reasoning=output.reasoning_delta,
-                                   tool_calls=tool_deltas)
+                    if config.stream:
+                        text_delta = output.text_delta
+                        reasoning_delta = output.reasoning_delta
+                        if parser is None:
+                            # Match ordinary Chat: finalization can flush text
+                            # withheld by incremental decoding without updating
+                            # the engine's pre-finalization delta.
+                            text_delta = output.text[len(previous_text):] if output.text else ""
+                            previous_text = output.text or previous_text
+                            reasoning_delta = (output.reasoning[len(previous_reasoning):]
+                                               if output.reasoning else "")
+                            previous_reasoning = output.reasoning or previous_reasoning
+                        if text_delta or reasoning_delta or tool_deltas:
+                            yield dict(request=rid, delta=text_delta, reasoning=reasoning_delta,
+                                       tool_calls=tool_deltas)
                     if output.finished:
                         final = output
                     output = None
