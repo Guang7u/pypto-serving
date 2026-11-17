@@ -109,7 +109,7 @@ class NativeServer(ServingServer):
 
     def _register_routes(self):
         super()._register_routes()
-        for suffix, handler in (("capabilities", self.native_capabilities), ("tokenize", self.native_tokenize),
+        for suffix, handler in (("capabilities", self.native_capabilities), ("prepare", self.native_prepare), ("tokenize", self.native_tokenize),
                                 ("generate", self.native_generate), ("objects/status", self.native_status),
                                 ("objects/release", self.native_release), ("objects/cancel", self.native_cancel)):
             self.app.add_api_route(INTERNAL_PREFIX + suffix, handler, methods=["POST"])
@@ -149,6 +149,27 @@ class NativeServer(ServingServer):
             native_mount=True, streaming=True, tools=True, durable=False,
             ordinary_prefix_cache=objects.cache.enable_prefix_cache, model_identity=self.model_identity))
 
+    @timing.timed("native.prepare")
+    async def native_prepare(self, request: HTTPRequest):
+        authorize(request.headers)
+        objects = self._objects()
+        raw = await request.json()
+        public = ChatCompletionRequest.model_validate(raw)
+        if public.model != self.model_id:
+            raise ValueError("model differs from the single owner")
+        prompt, config, parser, constraint = await self.prepare_chat(public)
+        self._validate_generation(config)
+        encoded = self.engine._tokenize_prompt(prompt)
+        if encoded is None:
+            raise ValueError("Native generation requires a non-empty prompt")
+        tokens = list(encoded)
+        self._budget(tokens, config)
+        return JSONResponse(objects.prepare_contract(dict(model=self.model_id, layout=objects.node.contract.layout,
+            prompt_token_ids=tokens, generation=asdict(config), parser=asdict(parser) if parser else None,
+            constraint=constraint.to_wire() if constraint else None, parallel_tool_calls=public.parallel_tool_calls,
+            model_identity=self.model_identity, rendering=self.rendering_profile(public),
+            session_kv_mode=self.session_kv_mode), raw))
+
     @timing.timed("native.tokenize")
     async def native_tokenize(self, request: HTTPRequest):
         authorize(request.headers)
@@ -179,9 +200,11 @@ class NativeServer(ServingServer):
             raise ValueError("Native Qwen3 sessions require greedy sampling")
 
     async def native_generate(self, request: HTTPRequest):
+        timing.mark("native.generate.validation.begin")
         authorize(request.headers)
         objects = self._objects()
         raw = await request.json()
+        objects.check_prepared(raw)
         if raw.get("model_identity") != self.model_identity:
             raise RouterError(409, "model_identity_mismatch", "Native generation checkpoint identity differs")
         if raw.get("model") != self.model_id or raw.get("layout") != objects.node.contract.layout:
@@ -219,6 +242,7 @@ class NativeServer(ServingServer):
             mounted_tokens=prefix.token_count if prefix else 0, native=None, error=None, done=asyncio.Event())
         self.core.scheduler.native_requests[rid] = entry
         successful = False
+        timing.mark("native.generate.validation.end")
         timing.mark("engine.submit")
         outputs = self.core.add_request(rid, "", config, prompt_token_ids=tokens,
             output_parser_spec=parser, constraint_spec=constraint, confirmed_prefix=prefix)
@@ -280,6 +304,7 @@ class NativeServer(ServingServer):
                     text=final.text, finish_reason=final.finish_reason, chat_finish_reason=self._chat_finish_reason(final),
                     reasoning=final.reasoning, tool_calls=[ToolCall(id=call.id, function=FunctionCall(
                         name=call.name, arguments=call.arguments)).model_dump() for call in calls])
+                result["terminal_evidence"] = objects.terminal_evidence(entry.native, raw)
                 successful = True
                 yield result
             finally:

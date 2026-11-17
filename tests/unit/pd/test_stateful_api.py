@@ -321,11 +321,50 @@ def test_prepared_single_prompt_cannot_be_mutated_to_bypass_prefix_validation():
                     generation={"max_new_tokens": 4}, parser=None, constraint=None,
                     parallel_tool_calls=True, model_identity={"fingerprint": "actual"},
                     rendering={"template_digest": "selected"}, session_kv_mode="input")
-    signed = objects.seal_prepared(prepared)
-    objects.check_prepared(dict(signed, tenant_id="tenant", parent={"object_id": "separate-scope-check"}))
+    scope = dict(tenant_id="tenant", cache_salt="salt", version_id="child")
+    signed = objects.prepare_contract(prepared, scope)
+    signed.update(scope)
+    objects.check_prepared(signed)
     for field, value in [("prompt_token_ids", [99, 12, 13]), ("generation", {"max_new_tokens": 5}),
                          ("rendering", {"template_digest": "different"})]:
         damaged = copy.deepcopy(signed)
         damaged[field] = value
         with pytest.raises(RouterError):
             objects.check_prepared(damaged)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("protocol", "native-prepared-v1"), ("policy", "strict"),
+    ("parent_digest", "tampered"), ("child_scope", {}),
+    ("prepared_owner", {}), ("kv_contract", {}),
+])
+def test_prepare_v2_rejects_contract_tampering(field, value):
+    from pypto_serving.router.http import RouterError
+    objects, _, _ = native_owner()
+    scope = dict(tenant_id="tenant", cache_salt="salt", version_id="child")
+    signed = objects.prepare_contract(dict(model="Qwen3-14B"), scope)
+    signed.update(scope)
+    signed[field] = value
+    with pytest.raises(RouterError):
+        objects.check_prepared(signed)
+
+
+def test_prepare_precheck_has_no_reference_and_generate_rechecks_loss_even_with_zero_mount():
+    from pypto_serving.pd.stateful import owner
+    from pypto_serving.router.http import RouterError
+    objects, p, d = native_owner()
+    entry, chunk = native_request(objects, p, d)
+    receipt = objects.retain(entry, chunk)
+    objects.cache.release_all_group_requests(entry.binding.request)
+    scope = dict(tenant_id="tenant", cache_salt="salt", version_id="child")
+    signed = objects.prepare_contract(dict(model="Qwen3-14B"), dict(scope, parent=receipt))
+    assert signed["parent_precheck"]["state"] == "live"
+    assert objects.status(receipt)["session_references"] == 1
+    objects.release(receipt)
+    with pytest.raises(RouterError) as error:
+        objects.mount(receipt, owner(scope), [999], mount_tokens=0)
+    assert error.value.code == "session_kv_lost"
+    cold = dict(signed, **scope, execution_plan="cold", recovery_parent=receipt)
+    objects.check_prepared(cold)
+    with pytest.raises(RouterError):
+        objects.check_prepared(dict(cold, policy="strict"))

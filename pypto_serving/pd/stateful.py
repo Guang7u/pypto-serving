@@ -79,19 +79,87 @@ class NativeObjects:
     def _signature(self, receipt, nonce):
         return hmac.new(self.secret, (nonce + ":" + digest(receipt)).encode(), hashlib.sha256).hexdigest()
 
+    def kv_contract(self):
+        return dict(protocol="native-prepare-v2", model=self.node.contract.model,
+                    layout=self.node.contract.layout, block_size=128,
+                    session_kv_mode=self.session_kv_mode, durability="volatile")
+
+    def prepare_contract(self, prepared, raw):
+        scope = owner(raw)
+        policy = raw.get("policy", "availability")
+        if policy not in {"strict", "availability"}:
+            raise ValueError("Unknown native parent policy")
+        parent = raw.get("parent")
+        state = self.parent_precheck(parent, scope)
+        return self.seal_prepared(dict(prepared, protocol="native-prepare-v2",
+            prepared_owner=dict(node_id=self.node.node_id, boot=self.node.boot, registry=self.node.registry),
+            child_scope=scope, parent_digest=digest(parent), policy=policy,
+            parent_precheck=state, kv_contract=self.kv_contract()))
+
+    def parent_precheck(self, parent, scope):
+        if parent is None:
+            return dict(state="absent")
+        # A retired boot cannot authenticate an old receipt. Only the same
+        # stable node/model may report retirement; Controller owns recovery.
+        if (parent.get("node_id") == self.node.node_id and parent.get("model") == self.node.contract.model
+                and (parent.get("boot") != self.node.boot or parent.get("registry") != self.node.registry)):
+            return dict(state="missing", reason="owner_boot_changed")
+        key = self._check(parent)
+        if any(parent.get(k) != scope[k] for k in ("tenant_id", "cache_salt_digest")):
+            raise RouterError(403, "native_owner_mismatch", "Parent belongs to another owner")
+        status = self.status(parent)
+        if status["request_active"] or status["transfer_references"]:
+            raise RouterError(409, "native_parent_busy", "Parent has not retired")
+        return dict(state="live" if key in self.objects else "missing", reason=(
+            None if key in self.objects else "physical_object_missing"))
+
     def seal_prepared(self, prepared):
         fields = ("model", "layout", "prompt_token_ids", "generation", "parser", "constraint",
-                  "parallel_tool_calls", "model_identity", "rendering", "session_kv_mode")
+                  "parallel_tool_calls", "model_identity", "rendering", "session_kv_mode",
+                  "protocol", "prepared_owner", "child_scope", "parent_digest", "policy",
+                  "parent_precheck", "kv_contract")
         payload = {key: prepared.get(key) for key in fields}
-        signature = hmac.new(self.secret, b"native-prepared-v1\0" + digest(payload).encode(),
+        signature = hmac.new(self.secret, b"native-prepared-v2\0" + digest(payload).encode(),
                              hashlib.sha256).hexdigest()
         return dict(prepared, prepared_signature=signature)
 
     def check_prepared(self, prepared):
         signature = prepared.get("prepared_signature")
         expected = self.seal_prepared(prepared)["prepared_signature"]
-        if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
-            raise RouterError(409, "native_prepared_mismatch", "Native prepared prompt was changed or belongs to an old boot")
+        if (prepared.get("protocol") != "native-prepare-v2"
+                or prepared.get("prepared_owner") != dict(node_id=self.node.node_id,
+                    boot=self.node.boot, registry=self.node.registry)
+                or prepared.get("kv_contract") != self.kv_contract()
+                or not isinstance(signature, str) or not hmac.compare_digest(signature, expected)):
+            raise RouterError(409, "native_prepared_mismatch", "Prepared was changed or belongs to an old boot")
+        if owner(prepared) != prepared.get("child_scope"):
+            raise RouterError(403, "native_owner_mismatch", "Prepared child owner differs")
+        parent = prepared.get("parent")
+        if digest(parent) != prepared.get("parent_digest"):
+            # Only an explicit Controller cold selection after confirmed loss
+            # may drop the signed parent; generate never selects this branch.
+            if (parent is not None or prepared.get("execution_plan") != "cold"
+                    or prepared.get("policy") != "availability"):
+                raise RouterError(409, "native_prepared_mismatch", "Prepared parent differs")
+        if prepared.get("execution_plan") == "cold":
+            original = prepared.get("recovery_parent")
+            if (original is None or digest(original) != prepared.get("parent_digest")
+                    or self.parent_precheck(original, owner(prepared)).get("state") != "missing"):
+                raise RouterError(409, "native_prepared_mismatch", "Cold selection lacks confirmed parent loss")
+        if prepared.get("execution_plan") == "cold" and parent is not None:
+            raise RouterError(409, "native_prepared_mismatch", "Cold execution cannot mount a parent")
+
+    def terminal_evidence(self, receipt, prepared):
+        with timing.span("native.terminal_evidence"):
+            status = self.status(receipt)
+            if (status["live"] is not True or status["session_references"] != 1
+                    or status["request_active"] or status["transfer_references"]):
+                raise RouterError(502, "native_retirement_unconfirmed", "Native request has not retired")
+            return dict(protocol="native-terminal-v2", native_digest=digest(receipt),
+                        prepared_signature=prepared["prepared_signature"], request=receipt["request_id"],
+                        execution_plan=prepared.get("execution_plan", "warm"),
+                        status={k: status[k] for k in ("live", "session_references",
+                            "request_active", "transfer_references")})
 
     @timing.timed("native.retain", engine=True)
     def retain(self, entry, chunk, *, computed_tokens=None):

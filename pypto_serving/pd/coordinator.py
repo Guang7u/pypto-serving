@@ -146,7 +146,7 @@ class PDCoordinator:
             payload["stream"] = _STREAM.validate_python(payload.get("stream", False))
             if path.startswith(INTERNAL_PREFIX):
                 if path != INTERNAL_PREFIX + "generate":
-                    if payload["stream"] and path != INTERNAL_PREFIX + "tokenize":
+                    if payload["stream"] and path not in {INTERNAL_PREFIX + "tokenize", INTERNAL_PREFIX + "prepare"}:
                         raise ValueError("Native ownership operations require stream=false")
                     return await self._native_owner_request(request, path, payload, session_id)
                 return await self._native_forward(request, path, owner, payload, session_id)
@@ -191,7 +191,7 @@ class PDCoordinator:
                 logger.warning("HTTP abort not confirmed node=%s result=%s", endpoint.name, result)
 
     async def _native_owner_request(self, request, path, payload, session_id):
-        if path in {INTERNAL_PREFIX + suffix for suffix in ("tokenize", "capabilities", "objects/cancel")}:
+        if path in {INTERNAL_PREFIX + suffix for suffix in ("prepare", "tokenize", "capabilities", "objects/cancel")}:
             candidates = [n for n in self.nodes.values() if n.role == "prefill"
                           and n.contract.model == payload.get("model")
                           and self.registry.state(n.node_id).routable]
@@ -234,6 +234,7 @@ class PDCoordinator:
         p_task = d_task = response = None
         finished = False
         native_confirmation = None
+        terminal_evidence = None
         async def before_close():
             if not finished:
                 # Abort wakes D's rendezvous before its HTTP task is joined.
@@ -258,7 +259,7 @@ class PDCoordinator:
         retirement = Retirement(self.active, owner, release_all, before_close)
 
         async def ready():
-            nonlocal native_confirmation
+            nonlocal native_confirmation, terminal_evidence
             result = await p_task
             if result.status_code != 200:
                 raise RouterError(result.status_code, "upstream_error", result.text, result)
@@ -268,6 +269,7 @@ class PDCoordinator:
                     if not isinstance(value, dict):
                         raise ValueError("Native confirmation must be an object")
                     native_confirmation = value.get("native")
+                    terminal_evidence = value.get("terminal_evidence")
                     expected = dict(native_owner(payload), node_id=p.node_id, boot=p.boot, registry=p.registry,
                                     model=p.contract.model, layout=p.contract.layout, request_id=binding.request,
                                     durability="volatile", retained_tokens=len(payload["prompt_token_ids"]) // 128 * 128,
@@ -275,7 +277,7 @@ class PDCoordinator:
                                     prefix_digest=digest(payload["prompt_token_ids"][:len(payload["prompt_token_ids"]) // 128 * 128]))
                     if parent is not None:
                         expected.update(mounted_object_id=parent.get("object_id"),
-                                        mounted_tokens=parent.get("retained_tokens"))
+                                        mounted_tokens=payload.get("mount_tokens", parent.get("retained_tokens")))
                     valid = (value.get("request") == binding.request and value.get("status") == "ready"
                              and isinstance(native_confirmation, dict)
                              and all(native_confirmation.get(k) == v for k, v in expected.items())
@@ -293,7 +295,7 @@ class PDCoordinator:
                     or not isinstance(value.get("token_ids"), list) or not value["token_ids"]
                     or any(type(token) is not int or token < 0 for token in value["token_ids"])):
                 raise ValueError("D returned an invalid native token result")
-            return dict(value, native=native_confirmation)
+            return dict(value, native=native_confirmation, terminal_evidence=terminal_evidence)
 
         try:
             def headers(peer):

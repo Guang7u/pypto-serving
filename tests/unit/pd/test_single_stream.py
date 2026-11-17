@@ -139,7 +139,7 @@ def test_single_stream_delivers_delta_before_last_ack_and_confirms_ownership(tmp
         await engine.start()
         try:
             server = NativeServer(engine, "Qwen3-14B", GenerateConfig(), session_kv_mode=mode)
-            tokenized = await server.native_tokenize(incoming("/tokenize", dict(model="Qwen3-14B",
+            tokenized = await server.native_prepare(incoming("/prepare", dict(model="Qwen3-14B", tenant_id="tenant", cache_salt="salt", version_id="stream-one",
                 messages=[dict(role="user", content="cpu prompt")], max_completion_tokens=2, stream=True,
                 temperature=0, top_p=1, chat_template_kwargs={"enable_thinking": False})))
             prepared = json.loads(tokenized.body)
@@ -196,7 +196,7 @@ def test_single_stream_worker_failure_never_publishes_a_native_success(tmp_path,
         await engine.start()
         try:
             server = NativeServer(engine, "Qwen3-14B", GenerateConfig(), session_kv_mode=mode)
-            response = await server.native_tokenize(incoming("/tokenize", dict(model="Qwen3-14B",
+            response = await server.native_prepare(incoming("/prepare", dict(model="Qwen3-14B", tenant_id="tenant", cache_salt="salt", version_id="stream-failure",
                 messages=[dict(role="user", content="cpu prompt")], max_completion_tokens=2, stream=True,
                 temperature=0, top_p=1)))
             prepared = json.loads(response.body)
@@ -236,19 +236,20 @@ def test_single_stream_close_retires_child_and_preserves_parent(tmp_path, monkey
         try:
             server = NativeServer(engine, "Qwen3-14B", GenerateConfig(), session_kv_mode=mode)
             messages = [dict(role="user", content="cpu prompt")]
-            async def prepare(stream):
-                response = await server.native_tokenize(incoming("/tokenize", dict(model="Qwen3-14B",
-                    messages=messages, max_completion_tokens=2, stream=stream, temperature=0, top_p=1)))
+            async def prepare(stream, version, parent=None):
+                response = await server.native_prepare(incoming("/tokenize", dict(model="Qwen3-14B",
+                    messages=messages, tenant_id="tenant", cache_salt="salt", version_id=version, parent=parent,
+                    max_completion_tokens=2, stream=stream, temperature=0, top_p=1)))
                 return json.loads(response.body)
             worker.released.set()
-            parent_response = await server.native_generate(incoming("/generate", dict(await prepare(False),
+            parent_response = await server.native_generate(incoming("/generate", dict(await prepare(False, "parent"),
                 tenant_id="tenant", cache_salt="salt", version_id="parent", stream=False)))
             parent = json.loads(parent_response.body)["native"]
             before = json.loads((await server.native_status(incoming("/objects/status", {"native": parent}))).body)
             worker.released.clear()
             messages.extend([dict(role="assistant", content="7 8"), dict(role="user", content="continue")])
             scope = dict(model="Qwen3-14B", tenant_id="tenant", cache_salt="salt", version_id="child")
-            response = await server.native_generate(incoming("/generate", dict(await prepare(True), **scope,
+            response = await server.native_generate(incoming("/generate", dict(await prepare(True, "child", parent), **scope,
                 parent=parent, mount_tokens=128, stream=True)))
             if close_stage == "delta":
                 first = json.loads((await anext(response.body_iterator)).removeprefix("data: "))
@@ -308,7 +309,7 @@ def test_single_stream_flushes_text_withheld_at_generation_end(
         await engine.start()
         try:
             server = NativeServer(engine, "Qwen3-14B", GenerateConfig(), session_kv_mode=mode)
-            prepared = await server.native_tokenize(incoming("/tokenize", dict(model="Qwen3-14B",
+            prepared = await server.native_prepare(incoming("/prepare", dict(model="Qwen3-14B", tenant_id="tenant", cache_salt="salt", version_id="trailing-text",
                 messages=[dict(role="user", content="cpu prompt")], max_completion_tokens=2,
                 stream=True, temperature=0, top_p=1)))
             response = await server.native_generate(incoming("/generate", dict(json.loads(prepared.body),

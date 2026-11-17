@@ -79,7 +79,7 @@ def test_single_stream_tool_delta_matches_confirmed_final_call(tmp_path, monkeyp
             server = NativeServer(engine, "Qwen3-14B", GenerateConfig(), session_kv_mode=mode)
             tools = [dict(type="function", function=dict(name="lookup", parameters=dict(type="object",
                 properties=dict(city=dict(type="string")), required=["city"])))]
-            prepared = await server.native_tokenize(incoming("/tokenize", dict(model="Qwen3-14B",
+            prepared = await server.native_prepare(incoming("/prepare", dict(model="Qwen3-14B", tenant_id="tenant", cache_salt="salt", version_id="tool-child",
                 messages=[dict(role="user", content="Look up Oslo")], tools=tools, tool_choice="auto",
                 stream=stream, parallel_tool_calls=parallel, max_completion_tokens=128, temperature=0, top_p=1,
                 chat_template_kwargs={"enable_thinking": False})))

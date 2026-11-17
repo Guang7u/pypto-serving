@@ -542,7 +542,8 @@ class Service:
         async def consume():
             resume = {}
             if entry.native_parent is not None:
-                prefix = self.native_objects.mount(entry.native_parent, entry.native_scope, continuation.tokens)
+                prefix = self.native_objects.mount(entry.native_parent, entry.native_scope, continuation.tokens,
+                                                   mount_tokens=entry.mounted_tokens)
                 entry.mounted_tokens = prefix.token_count
                 resume["confirmed_prefix"] = prefix
             async for _ in self.core.add_request(request, "", config, prompt_token_ids=continuation.tokens,

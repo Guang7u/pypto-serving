@@ -24,6 +24,7 @@ from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 import msgspec
 
+from pypto_serving.serving import request_timing as timing
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, ReplicaEngineCore
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.router.http import RouterError
@@ -97,7 +98,7 @@ class Server(ServingServer):
         self.app.add_api_route("/internal/pd/abort", self.abort, methods=["POST"])
         self.app.add_api_route("/internal/pd/requests/{request_id}", self.status, methods=["GET"])
         for suffix, handler in (("capabilities", self.native_capabilities),
-                                ("tokenize", self.native_tokenize), ("generate", self.native_generate),
+                                ("prepare", self.native_prepare), ("tokenize", self.native_tokenize), ("generate", self.native_generate),
                                 ("objects/status", self.native_status), ("objects/release", self.native_release),
                                 ("objects/cancel", self.native_cancel)):
             self.app.add_api_route(INTERNAL_PREFIX + suffix, handler, methods=["POST"])
@@ -141,6 +142,27 @@ class Server(ServingServer):
         objects.discard_owner(scope)
         return JSONResponse(dict(live=False, session_references=0))
 
+    @timing.timed("native.prepare")
+    async def native_prepare(self, request: HTTPRequest):
+        authorize(request.headers)
+        if not self.service.is_ready():
+            raise NodeUnavailable("P tokenizer is unavailable")
+        objects = self._native_objects()
+        raw = await request.json()
+        public = ChatCompletionRequest.model_validate(raw)
+        if public.model != self.service.node.contract.model:
+            raise ValueError("model differs from the P owner")
+        prompt, config, parser, constraint = await self.prepare_chat(public)
+        self.service.adapter.validate(config)
+        tokens = list(self.real_engine._tokenize_prompt(prompt))
+        if len(tokens) + config.max_new_tokens > self.real_engine.config.resolve_runtime_config().max_seq_len:
+            raise RouterError(400, "context_length_exceeded", "Input tokens plus output budget exceed model context")
+        return JSONResponse(objects.prepare_contract(dict(model=self.service.node.contract.model, layout=self.service.node.contract.layout,
+            prompt_token_ids=tokens, generation=asdict(config),
+            parser=asdict(parser) if parser else None, constraint=constraint.to_wire() if constraint else None,
+            parallel_tool_calls=public.parallel_tool_calls, model_identity=self.model_identity,
+            rendering=self.rendering_profile(public), session_kv_mode="input"), raw))
+
     async def native_tokenize(self, request: HTTPRequest):
         authorize(request.headers)
         if not self.service.is_ready():
@@ -177,7 +199,10 @@ class Server(ServingServer):
         return JSONResponse(self._native_objects().release(raw.get("native")))
 
     async def prepare_native(self, raw):
+        timing.mark("native.generate.validation.begin")
         node = self.service.node
+        if self.service.role == "prefill":
+            self._native_objects().check_prepared(raw)
         if raw.get("model_identity") != self.model_identity or self.model_identity is None:
             raise RouterError(409, "model_identity_mismatch", "Native generation checkpoint identity differs")
         if raw.get("model") != node.contract.model or raw.get("layout") != node.contract.layout:
@@ -214,7 +239,8 @@ class Server(ServingServer):
                 # Refuse an already-lost parent before D can acknowledge stream
                 # setup. Actual execution must still acquire its own references
                 # through the mount in Service.prefill; no page IDs escape here.
-                objects.mount(raw["parent"], scope, tokens)
+                objects.mount(raw["parent"], scope, tokens, mount_tokens=raw.get("mount_tokens"))
+        timing.mark("native.generate.validation.end")
         return Continuation(tuple(tokens), asdict(config), asdict(parser) if parser else None,
                             constraint.to_wire() if constraint else None), scope
 
@@ -262,6 +288,7 @@ class Server(ServingServer):
                 if native is not None:
                     continuation, entry.native_scope = native
                     entry.native_parent = raw.get("parent")
+                    entry.mounted_tokens = raw.get("mount_tokens")
                 else:
                     if kind == "chat":
                         prompt, config, parser, constraint = await self.prepare_chat(public)
@@ -284,6 +311,7 @@ class Server(ServingServer):
                     if entry.native is None:
                         raise RuntimeError("P did not confirm native retention")
                     result["native"] = entry.native
+                    result["terminal_evidence"] = self._native_objects().terminal_evidence(entry.native, raw)
                 return JSONResponse(result)
             except BaseException as exc:
                 if native is not None and self.service.native_objects is not None:
