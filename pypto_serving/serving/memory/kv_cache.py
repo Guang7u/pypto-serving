@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import hashlib
+
+from pypto_serving.serving import request_timing as timing
 import math
 import struct
 from dataclasses import dataclass, field, replace
@@ -794,6 +796,7 @@ class KvCacheManager:
             ]
         return hashes
 
+    @timing.timed("kv.acquire_group_prefix_blocks", engine=True)
     def acquire_group_prefix_blocks(
         self,
         request_id: str,
@@ -1045,6 +1048,7 @@ class KvCacheManager:
                                            valid_from, checkpoint_boundary)
         return cached_counts
 
+    @timing.timed("kv.attach_confirmed_group_prefix", engine=True)
     def attach_confirmed_group_prefix(
         self, request_id: str, prefix: ConfirmedGroupPrefix,
     ) -> dict[str, list[int]]:

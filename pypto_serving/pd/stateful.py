@@ -18,6 +18,8 @@ import os
 import re
 import secrets
 import uuid
+
+from pypto_serving.serving import request_timing as timing
 from dataclasses import dataclass
 
 from pypto_serving.router.http import RouterError
@@ -91,6 +93,7 @@ class NativeObjects:
         if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
             raise RouterError(409, "native_prepared_mismatch", "Native prepared prompt was changed or belongs to an old boot")
 
+    @timing.timed("native.retain", engine=True)
     def retain(self, entry, chunk, *, computed_tokens=None):
         previous = self.requests.get(entry.binding.request)
         if previous is not None:
@@ -178,6 +181,7 @@ class NativeObjects:
             self.requests.pop(record.receipt["request_id"], None)
         return self.status(receipt)
 
+    @timing.timed("native.mount.verify")
     def mount(self, receipt, scope, tokens, *, mount_tokens=None):
         from pypto_serving.serving.memory.kv_cache import ConfirmedGroupPrefix
 

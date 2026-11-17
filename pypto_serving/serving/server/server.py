@@ -18,6 +18,8 @@ import json
 import logging
 import time
 import uuid
+
+from pypto_serving.serving import request_timing as timing
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
@@ -221,6 +223,7 @@ class ServingServer:
         # back to this config; explicit per-request fields still win.
         self.generate_config = generate_config
         self.app = FastAPI(title="PyPTO Serving")
+        self.app.add_middleware(timing.TimingMiddleware, component="pypto")
         self._profile_lock = asyncio.Lock()
         self._constraint_preflight_lock = asyncio.Lock()
         self._constraint_preflight_provider: XGrammarProvider | None = None
@@ -404,6 +407,7 @@ class ServingServer:
             )
             return JSONResponse(response.model_dump())
 
+    @timing.timed("chat.prepare")
     async def prepare_chat(self, request):
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
@@ -611,6 +615,8 @@ class ServingServer:
                             finish_reason=finish_reason,
                         )],
                     )
+                    if delta or reasoning_delta:
+                        timing.mark("server.first_content")
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
                     if output.finished:

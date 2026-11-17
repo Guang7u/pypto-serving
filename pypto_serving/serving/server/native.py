@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
+from pypto_serving.serving import request_timing as timing
+
 from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -147,6 +149,7 @@ class NativeServer(ServingServer):
             native_mount=True, streaming=True, tools=True, durable=False,
             ordinary_prefix_cache=objects.cache.enable_prefix_cache, model_identity=self.model_identity))
 
+    @timing.timed("native.tokenize")
     async def native_tokenize(self, request: HTTPRequest):
         authorize(request.headers)
         objects = self._objects()
@@ -203,17 +206,20 @@ class NativeServer(ServingServer):
         constraint = ConstraintSpec.from_wire(raw["constraint"]) if raw.get("constraint") else None
         if constraint is not None:
             await self._preflight_constraint(constraint)
-        objects.check_prepared(raw)
+        with timing.span("native.check_prepared"):
+            objects.check_prepared(raw)
         if raw.get("session_kv_mode") != self.session_kv_mode:
             raise RouterError(409, "native_identity_mismatch", "Session mode differs from the configured owner")
         parent = raw.get("parent")
-        prefix = objects.mount(parent, scope, tokens, mount_tokens=raw.get("mount_tokens")) if parent is not None else None
+        with timing.span("native.mount"):
+            prefix = objects.mount(parent, scope, tokens, mount_tokens=raw.get("mount_tokens")) if parent is not None else None
         rid = "single-" + uuid.uuid4().hex
         entry = SimpleNamespace(binding=SingleBinding(rid, digest(raw)), native_scope=scope,
             continuation=Continuation(tuple(tokens), asdict(config), None, None), native_parent=parent,
             mounted_tokens=prefix.token_count if prefix else 0, native=None, error=None, done=asyncio.Event())
         self.core.scheduler.native_requests[rid] = entry
         successful = False
+        timing.mark("engine.submit")
         outputs = self.core.add_request(rid, "", config, prompt_token_ids=tokens,
             output_parser_spec=parser, constraint_spec=constraint, confirmed_prefix=prefix)
 
@@ -255,6 +261,7 @@ class NativeServer(ServingServer):
                                                if output.reasoning else "")
                             previous_reasoning = output.reasoning or previous_reasoning
                         if text_delta or reasoning_delta or tool_deltas:
+                            timing.mark("server.first_content")
                             yield dict(request=rid, delta=text_delta, reasoning=reasoning_delta,
                                        tool_calls=tool_deltas)
                     if output.finished:

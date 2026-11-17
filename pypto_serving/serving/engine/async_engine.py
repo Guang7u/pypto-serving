@@ -14,6 +14,8 @@ import contextlib
 import logging
 import queue
 import time
+
+from pypto_serving.serving import request_timing as timing
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
@@ -568,6 +570,8 @@ class ReplicaEngineCore:
         confirmed_prefix: ConfirmedGroupPrefix | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
+        timing.bind_engine(request_id, prompt_token_ids)
+        timing.mark("engine.admit.begin")
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
@@ -599,7 +603,10 @@ class ReplicaEngineCore:
             )
             self._request_contexts[request_id] = ctx
             try:
-                self.scheduler.add_request(request)
+                with timing.span("engine.scheduler.admit"):
+                    self.scheduler.add_request(request)
+                timing.mark("engine.queued", prompt_tokens=len(prompt_token_ids),
+                            explicit_prefix_tokens=confirmed_prefix.token_count if confirmed_prefix else 0)
             except BaseException:
                 self._request_contexts.pop(request_id, None)
                 raise
@@ -843,6 +850,10 @@ class ReplicaEngineCore:
                 ctx.queue.put_nowait(ValueError(reason))
             if request_id in self._worker_known_req_ids:
                 self._schedule_worker_free(request_id)
+        for scheduled in scheduler_output.scheduled_requests:
+            timing.mark("engine.first_schedule", engine_id=scheduled.request.request_id,
+                        reused_tokens=scheduled.num_computed_tokens,
+                        scheduled_tokens=scheduled.num_new_tokens)
         self._record_scheduler_stats(scheduler_output)
         # Preempted requests must release their worker-side cache / device slots;
         # queue their ids so the next StepCommand frees them.
@@ -867,6 +878,7 @@ class ReplicaEngineCore:
             step_cmd = self._build_step_command(
                 scheduler_output, finished_ids, step_id=self._step_counter
             )
+            timing.step_begin(scheduler_output)
             self._input_queue.put(encode_command(step_cmd))
         reregistered_ids = {
             request.request_id for request in step_cmd.new_requests
@@ -1233,6 +1245,7 @@ class ReplicaEngineCore:
                         positions[pos] += 1
                 else:
                     iteration.num_speculative_fallbacks += 1
+        timing.step_end(scheduler_output)
         request_outputs = self.scheduler.update_from_output(scheduler_output, new_tokens)
         if stat_logger is not None:
             iteration.num_iteration_tokens = scheduler_output.num_prefill_tokens + sum(
@@ -1253,6 +1266,7 @@ class ReplicaEngineCore:
             if ctx is None:
                 continue
 
+            timing.mark("engine.first_token", engine_id=req_output.request_id)
             if req_output.num_output_tokens is not None:
                 output_count = req_output.num_output_tokens
             else:
@@ -1849,7 +1863,9 @@ class AsyncLLMEngine:
     ) -> AsyncGenerator[TokenOutput, None]:
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
-        prompt_token_ids = self._tokenize_prompt(prompt)
+        timing.mark("engine.submit")
+        with timing.span("chat.tokenize"):
+            prompt_token_ids = self._tokenize_prompt(prompt)
         self.metrics.start_request(
             replica_idx,
             request_id,
@@ -1942,6 +1958,7 @@ class AsyncLLMEngine:
             raise AttributeError("scheduler and kv_cache_manager are only exposed for single-replica engines")
         return self._cores[0]
 
+    @timing.timed("tokenize.cpu")
     def _tokenize_prompt(self, prompt: str) -> Sequence[int] | None:
         prompt_token_ids = self.tokenizer.encode(prompt)
         if not prompt_token_ids and self.tokenizer.bos_token_id is not None:
