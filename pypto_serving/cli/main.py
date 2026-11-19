@@ -274,6 +274,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
+    if os.getenv("PYPTO_SESSION_DATABASE_URL") and (
+        not args.enable_native_sessions or args.pd_role or args.session_kv_mode != "input"
+    ):
+        raise ValueError("Local sessions require the non-PD native input deployment")
     if args.session_kv_mode != "input" and (not args.enable_native_sessions or args.pd_role):
         raise ValueError("Native input-output retention requires a single native deployment")
     _validate_backend(args.backend)

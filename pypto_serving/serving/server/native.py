@@ -12,6 +12,7 @@ import asyncio
 from contextlib import aclosing
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import uuid
@@ -98,7 +99,48 @@ class NativeServer(ServingServer):
         self.boot = uuid.uuid4().hex
         self.model_identity = load_model_identity(engine.config.model_dir, model_id, engine.tokenizer)
         self.objects = None
+        self.sessions = None
         super().__init__(engine, model_id, generate)
+        if os.getenv("PYPTO_SESSION_DATABASE_URL"):
+            if session_kv_mode != "input":
+                raise ValueError("Local session mode only supports single input retention")
+            from .session import SessionRuntime
+            from stateful_session.database import CatalogError
+            self.sessions = SessionRuntime(self)
+            self.app.router.add_event_handler("startup", self.sessions.start)
+            self.app.router.add_event_handler("shutdown", self.sessions.close)
+
+            async def state_error(request, exc):
+                return JSONResponse(dict(error=dict(code=exc.code, message=str(exc))), status_code=exc.status_code)
+
+            self.app.add_exception_handler(CatalogError, state_error)
+
+    async def _chat_completions(self, request: ChatCompletionRequest, http: HTTPRequest):
+        if request.stateful_context is None:
+            return await super()._chat_completions(request)
+        if self.sessions is None:
+            raise RouterError(503, "session_disabled", "Local session extension is not enabled")
+        return await self.sessions.handle(request, http)
+
+    async def session_delete(self, request: HTTPRequest):
+        authorize(request.headers)
+        if self.sessions is None:
+            raise RouterError(503, "session_disabled", "Local sessions are disabled")
+        raw = await request.json()
+        rid = raw.get("response_id")
+        if not isinstance(rid, str) or not rid:
+            raise ValueError("response_id is required")
+        await self.sessions.db(self.sessions.store.request_delete, rid, raw.get("tenant_id"))
+        return JSONResponse(dict(deleted=True, response_id=rid))
+
+    async def session_status(self, request: HTTPRequest):
+        authorize(request.headers)
+        if self.sessions is None:
+            raise RouterError(503, "session_disabled", "Local sessions are disabled")
+        return JSONResponse(dict(boot=self.boot, live_objects=len(self.objects.objects) if self.objects else 0,
+            pending_publications=self.sessions.candidates.qsize(),
+            active_executions=len(self.core.scheduler.native_requests),
+            database_pool=self.sessions.store.database.snapshot()))
 
     def _register_exception_handlers(self):
         super()._register_exception_handlers()
@@ -109,6 +151,8 @@ class NativeServer(ServingServer):
 
     def _register_routes(self):
         super()._register_routes()
+        self.app.add_api_route("/internal/stateful/v3/delete", self.session_delete, methods=["POST"])
+        self.app.add_api_route("/internal/stateful/v3/status", self.session_status, methods=["POST"])
         for suffix, handler in (("capabilities", self.native_capabilities), ("prepare", self.native_prepare), ("tokenize", self.native_tokenize),
                                 ("generate", self.native_generate), ("objects/status", self.native_status),
                                 ("objects/release", self.native_release), ("objects/cancel", self.native_cancel)):

@@ -28,6 +28,7 @@ from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
+from .session_protocol import StatefulContext
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
@@ -143,6 +144,7 @@ class ChatDelta(ChatMessage):
 
 
 class ChatCompletionRequest(BaseModel):
+    stateful_context: StatefulContext | None = None
     model: str = ""
     messages: list[ChatMessage]
     max_tokens: int | None = None
@@ -424,6 +426,8 @@ class ServingServer:
         return prompt, config, output_parser_spec, constraint_spec
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+        if request.stateful_context is not None:
+            raise ValueError("Session mode requires an enabled single-rank native server")
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         prompt, config, output_parser_spec, constraint_spec = await self.prepare_chat(request)
         return await self.chat_response(request_id, request, prompt, config, output_parser_spec, constraint_spec)

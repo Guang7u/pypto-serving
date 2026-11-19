@@ -259,3 +259,15 @@ def test_output_retention_mode_is_a_single_native_startup_option(tmp_path):
     with pytest.raises(ValueError, match="single native"):
         cli.build_serving_engine_config(_parse_cli_args([
             "--model", str(model), "--session-kv-mode", "input-output"]))
+
+
+@pytest.mark.parametrize("native,pd_role,mode", [
+    (False, None, "input"), (True, "prefill", "input"), (True, None, "input-output"),
+])
+def test_local_session_configuration_rejects_other_deployments(monkeypatch, native, pd_role, mode):
+    from types import SimpleNamespace
+    monkeypatch.setenv("PYPTO_SESSION_DATABASE_URL", "postgresql://unused")
+    from pypto_serving.cli.main import build_serving_engine_config
+    with pytest.raises(ValueError, match="non-PD native input"):
+        build_serving_engine_config(SimpleNamespace(enable_native_sessions=native, pd_role=pd_role,
+                                                    session_kv_mode=mode))

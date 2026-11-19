@@ -87,6 +87,23 @@ def current_headers():
     return {HEADER: trace.identifier} if trace is not None else {}
 
 
+@contextmanager
+def background(identifier, name):
+    """One opt-in record for work that outlives the original HTTP trace."""
+    if not identifier or not os.environ.get("SERVING_TIMING_FILE"):
+        yield
+        return
+    trace = Trace(identifier, "pypto-background", name)
+    token = _current.set(trace)
+    try:
+        trace.once("background.begin")
+        yield
+    finally:
+        trace.once("background.end")
+        _current.reset(token)
+        trace.finish()
+
+
 def mark(name, *, engine_id=None, **fields):
     trace = _engines.get(engine_id) if engine_id is not None else _current.get()
     if trace is not None:
